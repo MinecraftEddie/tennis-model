@@ -78,12 +78,13 @@ def format_factor_table(pick: MatchPick) -> str:
         f"├{sep}┤",
     ]
     labels = {
-        "ranking":            "Ranking          (25%)",
+        "ranking":            "Ranking          (20%)",
         "surface_form":       "Surface form     (20%)",
         "recent_form":        "Recent form      (15%)",
         "h2h":                "Head-to-head     (10%)",
         "tournament_exp":     "Career exp       (10%)",
-        "career_surface_pct": "Surface career%  (10%)",
+        "career_surface_pct": "Surface career%   (5%)",
+        "hold_break":         "Hold/Break prob  (10%)",
         "physical":           "Physical          (5%)",
         "rest":               "Rest factor       (5%)",
     }
