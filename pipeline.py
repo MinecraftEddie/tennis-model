@@ -217,16 +217,30 @@ def _top_up_from_api(pid: str, profile: PlayerProfile) -> None:
 
 
 def _top_up_from_tennis_abstract(profile: PlayerProfile) -> None:
-    """Tennis Abstract: public HTML stats page, no JS needed."""
+    """Tennis Abstract fallback. WTA pages are JS-rendered; only currentrank is extracted."""
     name_clean = (profile.full_name or profile.short_name).replace(" ", "").replace(".", "")
-    html = _get_html(f"https://www.tennisabstract.com/cgi-bin/player-classic.cgi?p={name_clean}")
+    is_wta = profile.data_source == "wta_static"
+    # WTA with known ranking: nothing useful available in static HTML, skip fetch entirely.
+    if is_wta and profile.ranking != 9999:
+        return
+    url = (f"https://www.tennisabstract.com/cgi-bin/wplayer.cgi?p={name_clean}"
+           if is_wta else
+           f"https://www.tennisabstract.com/cgi-bin/player-classic.cgi?p={name_clean}")
+    html = _get_html(url)
     if not html or len(html) < 500:
         return
 
     if profile.ranking == 9999:
-        m = re.search(r'(?:rank(?:ing)?)[^\d]{0,20}?#?(\d{1,4})\b', html, re.I)
+        # Try JS variable first (WTA pages)
+        m = re.search(r'var currentrank\s*=\s*(\d+)', html)
+        # Fall back to text pattern (ATP pages)
+        if not m:
+            m = re.search(r'(?:rank(?:ing)?)[^\d]{0,20}?#?(\d{1,4})\b', html, re.I)
         if m:
             profile.ranking = int(m.group(1))
+
+    if is_wta:
+        return
 
     for surface, wa, la in [("Hard","hard_wins","hard_losses"),
                              ("Clay","clay_wins","clay_losses"),
