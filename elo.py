@@ -19,6 +19,12 @@ K_FACTORS = {
 }
 
 
+def canonical_id(name: str) -> str:
+    """Canonical ELO player ID: strip, lowercase, spaces→underscore, dots removed.
+    Used in both elo_win_probability() and record_result() so IDs always match."""
+    return name.strip().lower().replace(" ", "_").replace(".", "")
+
+
 def ranking_to_elo(ranking: int) -> float:
     if ranking <= 0 or ranking >= 9999: return 1500.0
     if ranking <= 5:    return 2300.0

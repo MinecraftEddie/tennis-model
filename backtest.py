@@ -78,7 +78,8 @@ def store_prediction(pick) -> str:
         "id":            pred_id,
         "date":          today,
         "match":         f"{player_a} vs {player_b}",
-        "tournament":    pick.tournament,
+        "tournament":       pick.tournament,
+        "tournament_level": pick.tournament_level,
         "surface":       pick.surface,
         "tour":          pick.tour,
         "player_a":      player_a,
@@ -138,14 +139,13 @@ def record_result(prediction_id: str, winner: str) -> dict:
             log.info(f"Result recorded: {prediction_id}  winner={pred['winner']}  P&L={pl_str}")
 
             # Update ELO ratings
-            def _clean(name): return name.lower().replace(" ", "_").replace(".", "")
             loser = pred["player_b"] if pred["winner"] == pred["player_a"] else pred["player_a"]
             try:
-                from tennis_model.elo import get_elo_engine
+                from tennis_model.elo import get_elo_engine, canonical_id
                 elo = get_elo_engine()
                 elo.update(
-                    winner_id=_clean(pred["winner"]),
-                    loser_id=_clean(loser),
+                    winner_id=canonical_id(pred["winner"]),
+                    loser_id=canonical_id(loser),
                     surface=pred["surface"],
                     tournament_level=pred.get("tournament_level", "wta_250"),
                     winner_ranking=pred.get("winner_ranking", 9999),

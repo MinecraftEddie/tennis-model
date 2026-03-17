@@ -48,6 +48,13 @@ def compute_confidence(pa, pb, surface: str,
     elif gap >= 0.12:   score += 0.08
     elif gap < 0.05:    score -= 0.10
 
+    # --- Serve stats quality ---
+    # Real serve stats (scraped from Tennis Abstract matchmx): no penalty.
+    # Proxy (hard-court win% heuristic): -0.15 per player.
+    for p in [pa, pb]:
+        if p.serve_stats.get("source") != "tennis_abstract":
+            score -= 0.15
+
     # --- Validation penalty ---
     score -= validation.confidence_penalty
     if not validation.passed:
@@ -59,7 +66,6 @@ def compute_confidence(pa, pb, surface: str,
     cap = "HIGH" if gap < 0.05 else "VERY HIGH"
 
     # --- Classify ---
-    _labels = ["LOW", "MEDIUM", "HIGH", "VERY HIGH"]
     raw = (
         "VERY HIGH" if score >= 1.20 else
         "HIGH"      if score >= 0.80 else

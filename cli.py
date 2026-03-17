@@ -17,6 +17,15 @@ def main():
     import sys
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
+    os.makedirs("data", exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s — %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(os.path.join("data", "model.log"), encoding="utf-8"),
+        ],
+    )
     p = argparse.ArgumentParser(description="ATP Tennis Model v2")
     p.add_argument("--match",       type=str)
     p.add_argument("--tournament",  type=str,   default="ATP Tour")

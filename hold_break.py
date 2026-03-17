@@ -23,20 +23,45 @@ class ServiceStats:
     first_serve_won:  float = 0.72
     second_serve_won: float = 0.50
     break_pct:        float = 0.25
+    source:           str   = "proxy"   # "real" (Tennis Abstract) or "proxy" (hard_pct heuristic)
 
 
-def extract_stats(player) -> ServiceStats:
+def extract_stats(player, surface: str = "hard") -> ServiceStats:
     """
-    Proxy service stats from available profile data.
-    Uses hard-court win % as a proxy for serve effectiveness
-    when detailed serve stats are unavailable.
+    Extract service stats from player profile.
+
+    Priority:
+      1. Real stats from player.serve_stats (scraped from Tennis Abstract matchmx).
+         Uses surface-specific stats when n >= 5, falls back to career totals.
+      2. Proxy: career hard-court win% → heuristic serve numbers.
+         Less accurate; triggers a confidence penalty in confidence.py.
     """
+    surf = surface.lower()
+    serve = getattr(player, "serve_stats", {})
+
+    if serve and serve.get("source") == "tennis_abstract":
+        # Prefer surface-specific stats; fall back to career if surface sample is small
+        real = serve.get(surf) or serve.get("career")
+        if real:
+            s1in  = real["first_serve_in"]
+            s1won = real["first_serve_won"]
+            s2won = real["second_serve_won"]
+            p_srv = s1in * s1won + (1 - s1in) * s2won
+            return ServiceStats(
+                hold_pct         = round(p_srv, 4),
+                first_serve_in   = s1in,
+                first_serve_won  = s1won,
+                second_serve_won = s2won,
+                break_pct        = round(1.0 - p_srv, 4),
+                source           = "real",
+            )
+
+    # Proxy fallback: derive from career hard-court win%
     hw = getattr(player, "hard_wins",   0)
     hl = getattr(player, "hard_losses", 0)
     total_hard = hw + hl
     hard_pct = hw / total_hard if total_hard > 0 else 0.50
 
-    # Better hard-court players hold serve more often.
     # Anchor: tour average hold ≈ 0.65; scale ±0.10 around it.
     hold_pct = 0.55 + hard_pct * 0.20   # range [0.55, 0.75]
 
@@ -52,6 +77,7 @@ def extract_stats(player) -> ServiceStats:
         first_serve_won  = first_serve_won,
         second_serve_won = second_serve_won,
         break_pct        = break_pct,
+        source           = "proxy",
     )
 
 
@@ -143,8 +169,8 @@ def compute_hold_break_prob(pa, pb, surface: str,
     Full pipeline: extract stats → hold probs → set prob → match prob.
     Returns a dict including final (prob_a, prob_b).
     """
-    stats_a = extract_stats(pa)
-    stats_b = extract_stats(pb)
+    stats_a = extract_stats(pa, surface)
+    stats_b = extract_stats(pb, surface)
 
     hold_a = hold_probability(stats_a, stats_b, surface)
     hold_b = hold_probability(stats_b, stats_a, surface)

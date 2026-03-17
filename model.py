@@ -2,7 +2,7 @@ import logging
 from datetime import date
 
 from tennis_model.profiles import STATIC_PROFILES, WTA_PROFILES  # noqa: F401 (available for pipeline)
-from tennis_model.elo import get_elo_engine
+from tennis_model.elo import get_elo_engine, canonical_id
 from tennis_model.hold_break import compute_hold_break_prob
 from tennis_model.monte_carlo import run_simulation
 
@@ -106,8 +106,8 @@ def calculate_probability(pa, pb, surface, h2h_a, h2h_b,
                           market_odds_a=None, market_odds_b=None):
     s = surface.lower()
     _elo = get_elo_engine()
-    _id_a = pa.short_name.lower().replace(" ", "_").replace(".", "")
-    _id_b = pb.short_name.lower().replace(" ", "_").replace(".", "")
+    _id_a = canonical_id(pa.full_name or pa.short_name)
+    _id_b = canonical_id(pb.full_name or pb.short_name)
     elo_prob_a, elo_prob_b = _elo.elo_win_probability(
         _id_a, _id_b, surface, pa.ranking, pb.ranking
     )

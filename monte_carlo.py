@@ -124,13 +124,14 @@ def _simulate_match(p_serve_a: float, p_serve_b: float,
 
 def run_simulation(pa, pb, surface: str = "Hard",
                    best_of: int = 3,
-                   n_simulations: int = 5000) -> SimulationResult:
+                   n_simulations: int = 5000,
+                   seed: int | None = None) -> SimulationResult:
     """
     Run Monte Carlo simulation for a match.
     Returns SimulationResult with win probs and match statistics.
     """
-    stats_a = extract_stats(pa)
-    stats_b = extract_stats(pb)
+    stats_a = extract_stats(pa, surface)
+    stats_b = extract_stats(pb, surface)
 
     # Surface adjustment on serve win probability
     surf_adj = {"hard": 0.0, "clay": -0.03, "grass": +0.03}
@@ -146,7 +147,8 @@ def run_simulation(pa, pb, surface: str = "Hard",
     tiebreaks   = 0
     sets_played = []
 
-    random.seed(42)  # reproducible results
+    if seed is not None:
+        random.seed(seed)
     for _ in range(n_simulations):
         result = _simulate_match(p_serve_a, p_serve_b, best_of)
         if result["winner"] == "a":

@@ -10,6 +10,7 @@ from typing import Optional
 import requests
 
 from tennis_model.profiles import STATIC_PROFILES, WTA_PROFILES, PLAYER_ID_MAP
+from tennis_model.elo import get_elo_engine, canonical_id
 from tennis_model.model import calculate_probability, fair_odds, edge_pct
 from tennis_model.validation import validate_match
 from tennis_model.confidence import compute_confidence
@@ -61,6 +62,7 @@ class PlayerProfile:
     recent_form:      list  = field(default_factory=list)
     career_high_rank: int   = 9999
     data_source:      str   = "unknown"
+    serve_stats:      dict  = field(default_factory=dict)
 
 
 @dataclass
@@ -216,6 +218,71 @@ def _top_up_from_api(pid: str, profile: PlayerProfile) -> None:
             profile.recent_form = form[:10]
 
 
+def _parse_ta_serve_stats(html: str) -> dict:
+    """Parse per-match serve stats from Tennis Abstract matchmx JS array.
+
+    matchhead column indices (confirmed from live page):
+      2=surf, 23=pts, 24=firsts(1stIn), 25=fwon(1stWon), 26=swon(2ndWon),
+      32=opts(opp service pts), 34=ofwon(opp 1st won), 35=oswon(opp 2nd won)
+
+    Returns a dict keyed by surface ('career','hard','clay','grass') plus
+    'source'='tennis_abstract', or empty dict on any parse failure.
+    """
+    import json as _json
+    m = re.search(r'var matchmx\s*=\s*(\[.*?\]);', html, re.S)
+    if not m:
+        return {}
+    try:
+        rows = _json.loads(m.group(1))
+    except (ValueError, TypeError):
+        return {}
+
+    def _agg(surface=None):
+        pts = firsts = fwon = swon = opts = ofwon = oswon = n = 0
+        for r in rows:
+            if len(r) <= 35:
+                continue
+            if surface and r[2].lower() != surface:
+                continue
+            try:
+                _pts = int(r[23]) if r[23] else 0
+                if _pts == 0:
+                    continue
+                pts    += _pts
+                firsts += int(r[24] or 0)
+                fwon   += int(r[25] or 0)
+                swon   += int(r[26] or 0)
+                opts   += int(r[32] or 0)
+                ofwon  += int(r[34] or 0)
+                oswon  += int(r[35] or 0)
+                n      += 1
+            except (ValueError, IndexError, TypeError):
+                continue
+        if pts == 0 or firsts == 0:
+            return None
+        second_pts = pts - firsts
+        return {
+            "first_serve_in":    round(firsts / pts, 4),
+            "first_serve_won":   round(fwon / firsts, 4),
+            "second_serve_won":  round(swon / second_pts, 4) if second_pts > 0 else 0.50,
+            "return_points_won": round(1 - (ofwon + oswon) / opts, 4) if opts > 0 else 0.38,
+            "n": n,
+        }
+
+    result: dict = {}
+    career = _agg()
+    if career:
+        result["career"] = career
+    for surf in ("hard", "clay", "grass"):
+        s = _agg(surf)
+        if s and s["n"] >= 5:
+            result[surf] = s
+    if not result:
+        return {}
+    result["source"] = "tennis_abstract"
+    return result
+
+
 def _top_up_from_tennis_abstract(profile: PlayerProfile) -> None:
     """Tennis Abstract fallback. WTA pages are JS-rendered; only currentrank is extracted."""
     name_clean = (profile.full_name or profile.short_name).replace(" ", "").replace(".", "")
@@ -255,8 +322,40 @@ def _top_up_from_tennis_abstract(profile: PlayerProfile) -> None:
         form = re.findall(r'\b([WL])\b', html)
         profile.recent_form = form[:10]
 
+    # Serve stats: parse from matchmx JS array (ATP pages only — real point-level data)
+    if not profile.serve_stats:
+        ss = _parse_ta_serve_stats(html)
+        if ss:
+            profile.serve_stats = ss
+            log.info(
+                f"{profile.short_name}: serve stats from Tennis Abstract "
+                f"({ss.get('career', {}).get('n', 0)} career matches with data)"
+            )
+
     if profile.ranking < 9999 or profile.hard_wins > 0:
         profile.data_source = "tennis_abstract"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# INACTIVITY HELPER
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _days_inactive(profile: PlayerProfile) -> int:
+    """Days since the player's last recorded ELO result.
+    Returns 0 if no history exists (new player, no results recorded yet).
+    Only non-zero when the ELO entry has matches_played > 0, meaning a real
+    result was recorded via --record, not just an initialisation from today's run."""
+    elo = get_elo_engine()
+    pid = canonical_id(profile.full_name or profile.short_name)
+    entry = elo.ratings.get(pid)
+    if entry and entry.matches_played > 0:
+        try:
+            last = date.fromisoformat(entry.last_updated)
+            return (date.today() - last).days
+        except ValueError:
+            pass
+    log.debug(f"{profile.short_name}: no ELO history — days_inactive unknown, defaulting to 0")
+    return 0
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PROFILE BUILDER
@@ -301,7 +400,14 @@ def fetch_player_profile(short_name: str) -> PlayerProfile:
         _top_up_from_api(pid, profile)
 
     # Layer 3: Tennis Abstract fallback
-    if profile.ranking == 9999 or (profile.hard_wins == 0 and profile.clay_wins == 0):
+    # Triggers when: ranking unknown, surface data missing, OR serve_stats not yet populated
+    # (WTA players with known ranking skip the fetch inside _top_up_from_tennis_abstract)
+    needs_ta = (
+        profile.ranking == 9999
+        or (profile.hard_wins == 0 and profile.clay_wins == 0)
+        or (not profile.serve_stats and profile.data_source != "wta_static")
+    )
+    if needs_ta:
         _top_up_from_tennis_abstract(profile)
 
     log.info(
@@ -419,10 +525,15 @@ def run_match(
     )
 
     # --- EV filter ---
-    ev_a = (compute_ev(market_odds_a, fo_a, validation, confidence)
+    # days_inactive: uses ELO history (matches_played > 0 = real recorded result).
+    # New players with no results return 0 — we cannot infer inactivity from ELO alone.
+    days_inactive = max(_days_inactive(pa), _days_inactive(pb))
+    if days_inactive > 0:
+        log.info(f"Days inactive (max of both players): {days_inactive}")
+    ev_a = (compute_ev(market_odds_a, fo_a, validation, confidence, days_inactive)
             if market_odds_a else EVResult(edge=0.0, is_value=False,
                                            filter_reason="NO MARKET ODDS"))
-    ev_b = (compute_ev(market_odds_b, fo_b, validation, confidence)
+    ev_b = (compute_ev(market_odds_b, fo_b, validation, confidence, days_inactive)
             if market_odds_b else EVResult(edge=0.0, is_value=False,
                                            filter_reason="NO MARKET ODDS"))
     best_ev = ev_a if ev_a.edge > ev_b.edge else ev_b
