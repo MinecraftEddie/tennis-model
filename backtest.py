@@ -48,14 +48,6 @@ def _make_id(match_date: str, player_a: str, player_b: str) -> str:
     return f"{match_date}_{a_last}_{b_last}"
 
 
-def _confidence(edge_pct: float) -> str:
-    """edge_pct is in percentage points (e.g. 33.3, not 0.333)."""
-    if edge_pct >= 20.0:
-        return "HIGH"
-    elif edge_pct >= 10.0:
-        return "MEDIUM"
-    return "LOW"
-
 # ──────────────────────────────────────────────────────────────────────────────
 # PUBLIC API
 # ──────────────────────────────────────────────────────────────────────────────
@@ -71,17 +63,9 @@ def store_prediction(pick) -> str:
     player_b = pick.player_b.full_name or pick.player_b.short_name
     pred_id  = _make_id(today, player_a, player_b)
 
-    # Determine which side is the pick
-    edge_a = pick.edge_a or 0.0
-    edge_b = pick.edge_b or 0.0
-    if edge_a >= edge_b and edge_a > 0:
-        pick_name = player_a
-        pick_odds = pick.market_odds_a
-        pick_edge = edge_a
-    else:
-        pick_name = player_b
-        pick_odds = pick.market_odds_b
-        pick_edge = edge_b
+    pick_name = pick.pick_player or player_a
+    pick_odds = pick.market_odds_a if pick_name == player_a else pick.market_odds_b
+    pick_edge = pick.edge_a if pick_name == player_a else pick.edge_b or 0.0
 
     data = _load()
 
@@ -106,12 +90,12 @@ def store_prediction(pick) -> str:
         "best_odds_a":   pick.market_odds_a,
         "best_odds_b":   pick.market_odds_b,
         # stored as decimal fraction (0.305 = 30.5%) to match schema
-        "edge_a":        round(edge_a / 100, 3) if pick.edge_a is not None else None,
-        "edge_b":        round(edge_b / 100, 3) if pick.edge_b is not None else None,
+        "edge_a":        round(pick.edge_a / 100, 3) if pick.edge_a is not None else None,
+        "edge_b":        round(pick.edge_b / 100, 3) if pick.edge_b is not None else None,
         "pick":          pick_name,
         "pick_odds":     pick_odds,
         "bookmaker":     pick.bookmaker,
-        "confidence":    _confidence(pick_edge),
+        "confidence":    pick.confidence,
         "model_version": MODEL_VERSION,
         "result":        None,
         "winner":        None,
