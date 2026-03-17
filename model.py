@@ -34,11 +34,6 @@ def _norm(a: float, b: float) -> tuple[float, float]:
     t = a + b
     return (a/t, b/t) if t > 0 else (0.5, 0.5)
 
-def _ranking_score(pa, pb):
-    ra = pa.ranking if pa.ranking < 9999 else 500
-    rb = pb.ranking if pb.ranking < 9999 else 500
-    return _norm(1/max(ra,1), 1/max(rb,1))
-
 def _surface_form_score(pa, pb, surf):
     """Surface-adjusted recent form: 60% recent L10 win% + 40% career surface win%.
     Note: recent_form stores W/L without surface tags, so recent form is used

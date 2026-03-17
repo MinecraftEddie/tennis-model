@@ -6,8 +6,6 @@ import time
 
 import requests
 
-from tennis_model.formatter import EDGE_ALERT_THRESHOLD
-
 log = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
@@ -52,10 +50,6 @@ def maybe_alert(pick: MatchPick, card: str) -> None:
         log.warning("ALERT SUPPRESSED — no market odds on either side")
         return
 
-    max_e = max(pick.edge_a or 0, pick.edge_b or 0)
-    if max_e >= EDGE_ALERT_THRESHOLD:
-        from tennis_model.backtest import store_prediction
-        store_prediction(pick)
-        send_telegram(f"⚡ <b>EDGE ALERT</b>\n\n{card}")
-    else:
-        log.info(f"Edge {max_e:.1f}% below {EDGE_ALERT_THRESHOLD}% threshold — no alert.")
+    from tennis_model.backtest import store_prediction
+    store_prediction(pick)
+    send_telegram(f"⚡ <b>EDGE ALERT</b>\n\n{card}")

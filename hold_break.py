@@ -6,7 +6,6 @@ and match-win probability.  Integrated into calculate_probability()
 as the "hold_break" component.
 """
 from dataclasses import dataclass
-from functools import lru_cache
 
 
 # Surface multipliers applied to the server's raw point-win probability
