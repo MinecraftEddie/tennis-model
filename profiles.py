@@ -504,6 +504,26 @@ WTA_PROFILES = {
         ytd_wins=7, ytd_losses=8,
         recent_form=["L","W","L","W","L","W","W","L","W","L"],
     ),
+    "paula badosa": dict(
+        full_name="Paula Badosa", ranking=27, age=28, height_cm=174,
+        plays="Right-handed", turned_pro=2016,
+        career_wins=212, career_losses=148, career_high_rank=2,
+        hard_wins=108, hard_losses=72,
+        clay_wins=82,  clay_losses=58,
+        grass_wins=22,  grass_losses=18,
+        ytd_wins=9, ytd_losses=4,
+        recent_form=["W","W","W","L","W","W","W","L","W","W"],
+    ),
+    "qualifier": dict(
+        full_name="Qualifier", ranking=118, age=24, height_cm=170,
+        plays="Right-handed", turned_pro=2020,
+        career_wins=58,  career_losses=54, career_high_rank=110,
+        hard_wins=26, hard_losses=26,
+        clay_wins=22, clay_losses=20,
+        grass_wins=10, grass_losses=8,
+        ytd_wins=5, ytd_losses=4,
+        recent_form=["W","L","W","W","L","W","L","L","W","W"],
+    ),
     "darja vidmanova": dict(
         full_name="Darja Vidmanova", ranking=118, age=20, height_cm=175,
         plays="Right-handed", turned_pro=2021,
@@ -513,5 +533,121 @@ WTA_PROFILES = {
         grass_wins=11, grass_losses=10,
         ytd_wins=5, ytd_losses=8,
         recent_form=["W","W","L","W","W","W","L","W","W","L"],
+    ),
+    # ── Name-registry entries: full_name only (all stats fetched live from jsfrags) ──
+    # Add new players here with just physical attributes — no manual stat maintenance needed.
+    "iga swiatek": dict(
+        full_name="Iga Swiatek", age=24, height_cm=175, plays="Right-handed",
+        turned_pro=2016, career_wins=370, career_losses=80, career_high_rank=1,
+    ),
+    "aryna sabalenka": dict(
+        full_name="Aryna Sabalenka", age=26, height_cm=182, plays="Right-handed",
+        turned_pro=2015, career_wins=350, career_losses=130, career_high_rank=1,
+    ),
+    "coco gauff": dict(
+        full_name="Coco Gauff", age=21, height_cm=183, plays="Right-handed",
+        turned_pro=2020, career_wins=220, career_losses=90, career_high_rank=2,
+    ),
+    "jessica pegula": dict(
+        full_name="Jessica Pegula", age=31, height_cm=170, plays="Right-handed",
+        turned_pro=2010, career_wins=240, career_losses=160, career_high_rank=3,
+    ),
+    "qinwen zheng": dict(
+        full_name="Qinwen Zheng", age=22, height_cm=181, plays="Right-handed",
+        turned_pro=2019, career_wins=150, career_losses=95, career_high_rank=5,
+    ),
+    "elena rybakina": dict(
+        full_name="Elena Rybakina", age=25, height_cm=184, plays="Right-handed",
+        turned_pro=2016, career_wins=195, career_losses=100, career_high_rank=4,
+    ),
+    "mirra andreeva": dict(
+        full_name="Mirra Andreeva", age=18, height_cm=172, plays="Right-handed",
+        turned_pro=2023, career_wins=85, career_losses=55, career_high_rank=12,
+    ),
+    "diana shnaider": dict(
+        full_name="Diana Shnaider", age=20, height_cm=178, plays="Left-handed",
+        turned_pro=2021, career_wins=100, career_losses=60, career_high_rank=10,
+    ),
+    "emma navarro": dict(
+        full_name="Emma Navarro", age=23, height_cm=175, plays="Right-handed",
+        turned_pro=2022, career_wins=95, career_losses=55, career_high_rank=8,
+    ),
+    "danielle collins": dict(
+        full_name="Danielle Collins", age=31, height_cm=170, plays="Right-handed",
+        turned_pro=2016, career_wins=210, career_losses=145, career_high_rank=7,
+    ),
+    "amanda anisimova": dict(
+        full_name="Amanda Anisimova", age=23, height_cm=175, plays="Right-handed",
+        turned_pro=2018, career_wins=165, career_losses=110, career_high_rank=21,
+    ),
+    "madison keys": dict(
+        full_name="Madison Keys", age=30, height_cm=178, plays="Right-handed",
+        turned_pro=2009, career_wins=420, career_losses=250, career_high_rank=7,
+    ),
+    "caroline ruse": dict(
+        full_name="Caroline Ruse", ranking=120, age=26, height_cm=168, plays="Right-handed",
+        turned_pro=2017, career_wins=110, career_losses=90, career_high_rank=91,
+        hard_wins=55, hard_losses=45, ytd_wins=3, ytd_losses=4,
+        recent_form=["W","L","W","L","L","W","L","W","W","L"],
+    ),
+    "karolina muchova": dict(
+        full_name="Karolina Muchova", age=28, height_cm=176, plays="Right-handed",
+        turned_pro=2016, career_wins=175, career_losses=115, career_high_rank=8,
+    ),
+    "barbora krejcikova": dict(
+        full_name="Barbora Krejcikova", age=29, height_cm=172, plays="Right-handed",
+        turned_pro=2013, career_wins=290, career_losses=170, career_high_rank=2,
+    ),
+    "anna kalinskaya": dict(
+        full_name="Anna Kalinskaya", age=26, height_cm=176, plays="Right-handed",
+        turned_pro=2016, career_wins=130, career_losses=95, career_high_rank=11,
+    ),
+    "liudmila samsonova": dict(
+        full_name="Liudmila Samsonova", age=26, height_cm=175, plays="Right-handed",
+        turned_pro=2015, career_wins=170, career_losses=105, career_high_rank=12,
+    ),
+    "jasmine paolini": dict(
+        full_name="Jasmine Paolini", age=29, height_cm=163, plays="Right-handed",
+        turned_pro=2013, career_wins=270, career_losses=180, career_high_rank=4,
+    ),
+    "victoria mboko": dict(
+        full_name="Victoria Mboko", age=19, height_cm=173, plays="Right-handed",
+        turned_pro=2022, career_wins=60, career_losses=40, career_high_rank=50,
+    ),
+    "elina svitolina": dict(
+        full_name="Elina Svitolina", age=30, height_cm=175, plays="Right-handed",
+        turned_pro=2010, career_wins=500, career_losses=220, career_high_rank=3,
+    ),
+    "daria kasatkina": dict(
+        full_name="Daria Kasatkina", age=27, height_cm=168, plays="Right-handed",
+        turned_pro=2014, career_wins=280, career_losses=180, career_high_rank=8,
+    ),
+    "clara tauson": dict(
+        full_name="Clara Tauson", age=22, height_cm=179, plays="Right-handed",
+        turned_pro=2020, career_wins=120, career_losses=80, career_high_rank=25,
+    ),
+    "jelena ostapenko": dict(
+        full_name="Jelena Ostapenko", age=27, height_cm=175, plays="Right-handed",
+        turned_pro=2012, career_wins=300, career_losses=220, career_high_rank=5,
+    ),
+    "naomi osaka": dict(
+        full_name="Naomi Osaka", age=27, height_cm=180, plays="Right-handed",
+        turned_pro=2013, career_wins=230, career_losses=90, career_high_rank=1,
+    ),
+    "victoria azarenka": dict(
+        full_name="Victoria Azarenka", age=35, height_cm=183, plays="Right-handed",
+        turned_pro=2002, career_wins=600, career_losses=270, career_high_rank=1,
+    ),
+    "donna vekic": dict(
+        full_name="Donna Vekic", age=28, height_cm=180, plays="Right-handed",
+        turned_pro=2010, career_wins=250, career_losses=210, career_high_rank=19,
+    ),
+    "alexandra eala": dict(
+        full_name="Alexandra Eala", age=19, height_cm=163, plays="Right-handed",
+        turned_pro=2021, career_wins=80, career_losses=60, career_high_rank=29,
+    ),
+    "marie bouzkova": dict(
+        full_name="Marie Bouzkova", age=26, height_cm=170, plays="Right-handed",
+        turned_pro=2016, career_wins=120, career_losses=100, career_high_rank=30,
     ),
 }

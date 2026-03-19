@@ -2,7 +2,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, date
 import json, os, math
 
-ELO_FILE = "data/elo_ratings.json"
+_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ELO_FILE = os.path.join(_DIR, "data", "elo_ratings.json")
 
 # K-factors by tournament level
 K_FACTORS = {
@@ -68,7 +69,7 @@ class TennisELO:
                 pass
 
     def _save(self):
-        os.makedirs("data", exist_ok=True)
+        os.makedirs(os.path.join(_DIR, "data"), exist_ok=True)
         with open(ELO_FILE, "w") as f:
             data = {k: vars(v) for k, v in self.ratings.items()}
             json.dump(data, f, indent=2)
@@ -131,13 +132,47 @@ class TennisELO:
         self._save()
         return w, l
 
+    def _apply_decay(self, player_id: str) -> int:
+        """
+        Decay ratings towards 1500 for inactive players.
+        Rate: 0.5% per 30 days beyond the 90-day threshold.
+        Returns days_inactive (0 if no history or within threshold).
+        Only applied when matches_played > 0 (real ELO history exists).
+        """
+        p = self.ratings.get(player_id)
+        if not p or p.matches_played == 0 or not p.last_updated:
+            return 0
+        try:
+            last = date.fromisoformat(p.last_updated)
+        except ValueError:
+            return 0
+        days = (date.today() - last).days
+        if days <= 90:
+            return days
+        # Decay factor: 0.5% per 30-day period beyond 90 days
+        excess_periods = (days - 90) / 30
+        decay = 1.0 - (0.005 * excess_periods)
+        decay = max(decay, 0.85)  # floor at 85% to prevent collapse
+        MEAN = 1500.0
+        for attr in ("overall", "hard", "clay", "grass", "recent"):
+            old = getattr(p, attr)
+            new = round(MEAN + (old - MEAN) * decay, 2)
+            setattr(p, attr, new)
+        log.debug(
+            f"ELO decay applied to {player_id}: "
+            f"{days}d inactive, factor={decay:.4f}"
+        )
+        return days
+
     def get_final_rating(self, player_id: str, surface: str,
                          ranking: int = 9999) -> float:
         """
         Final blended ELO used by the model:
         0.50 * surface_elo + 0.30 * overall_elo + 0.20 * recent_elo
+        Decay towards mean applied for players inactive >90 days.
         """
         p = self.get_or_init(player_id, ranking)
+        self._apply_decay(player_id)
         surf_elo = getattr(p, surface.lower(), p.overall)
         return round(
             0.50 * surf_elo +

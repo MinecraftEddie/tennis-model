@@ -4,34 +4,45 @@ from tennis_model.validation import ValidationResult
 def compute_confidence(pa, pb, surface: str,
                        validation: ValidationResult,
                        edge: float,
-                       model_prob: float) -> str:
+                       model_prob: float,
+                       days_inactive: int = -1) -> str:
 
     score = 0.0
     surf = surface.lower()
 
     # --- Data source quality ---
     source_scores = {
-        "static_curated": 0.30,
-        "wta_static":     0.25,
-        "atp_api":        0.15,
-        "tennis_abstract":0.10,
-        "unknown":       -0.20,
-        "fallback":      -0.20,
+        "static_curated":  0.30,
+        "wta_static":      0.15,  # was 0.25; -0.10 staleness penalty (manually-maintained data)
+        "atp_api":         0.15,
+        "tennis_abstract": 0.10,
+        "wta_estimated":  -0.25,   # estimated profile — heavy penalty
+        "unknown":        -0.20,
+        "fallback":       -0.20,
     }
     score += source_scores.get(pa.data_source, 0.0)
     score += source_scores.get(pb.data_source, 0.0)
 
     # --- Surface sample depth ---
+    # Cap at 1500: any value above that is a parsing artifact (no player has
+    # more than ~1200 wins on a single surface), and should be treated as 0.
     for p in [pa, pb]:
-        n = getattr(p, f"{surf}_wins", 0) + getattr(p, f"{surf}_losses", 0)
+        raw_n = getattr(p, f"{surf}_wins", 0) + getattr(p, f"{surf}_losses", 0)
+        n = raw_n if raw_n <= 1500 else 0
         if n >= 50:   score += 0.20
         elif n >= 30: score += 0.12
         elif n >= 15: score += 0.05
         elif n < 10:  score -= 0.10
 
     # --- Season activity ---
+    # None means the data source structurally does not provide YTD (ATP matchmx).
+    # Unknown YTD is not the same as confirmed inactive: skip scoring entirely.
+    # Only apply the inactive penalty when data was fetched and is confirmed zero
+    # (WTA jsfrags real 0-0 = genuinely inactive this season).
     for p in [pa, pb]:
-        ytd = p.ytd_wins + p.ytd_losses
+        if p.ytd_wins is None and p.ytd_losses is None:
+            continue  # unknown — no bonus, no penalty
+        ytd = (p.ytd_wins or 0) + (p.ytd_losses or 0)
         if ytd >= 15:   score += 0.10
         elif ytd >= 8:  score += 0.05
         elif ytd == 0:  score -= 0.20
@@ -49,11 +60,43 @@ def compute_confidence(pa, pb, surface: str,
     elif gap < 0.05:    score -= 0.10
 
     # --- Serve stats quality ---
-    # Real serve stats (scraped from Tennis Abstract matchmx): no penalty.
+    # Real serve stats (Tennis Abstract ATP matchmx or WTA jsfrags): no penalty.
     # Proxy (hard-court win% heuristic): -0.15 per player.
+    _real_sources = ("tennis_abstract", "tennis_abstract_wta")
     for p in [pa, pb]:
-        if p.serve_stats.get("source") != "tennis_abstract":
+        if p.serve_stats.get("source") not in _real_sources:
             score -= 0.15
+
+    # --- WTA serve surface mismatch ---
+    # jsfrags recent-results only cover recent matches — in early season these are
+    # all on hard.  When surface is clay/grass and no surface-specific serve key
+    # exists, extract_stats() silently falls back to hard-biased career averages.
+    # That data still carries source="tennis_abstract_wta" so no penalty fires above.
+    # Apply -0.08 per player to correct for the unacknowledged hard-court bias.
+    if surf in ("clay", "grass"):
+        for p in [pa, pb]:
+            ss = p.serve_stats or {}
+            if ss.get("source") == "tennis_abstract_wta":
+                surf_n = ss.get(surf, {}).get("n", 0)
+                if surf_n < 5:
+                    score -= 0.08
+
+    # --- WTA serve sample too small ---
+    # At n < 8, average-of-averages bias is severe (each match carries 1/n weight
+    # regardless of match length).  Apply a modest penalty per player.
+    for p in [pa, pb]:
+        ss = p.serve_stats or {}
+        if ss.get("source") == "tennis_abstract_wta":
+            n = ss.get("career", {}).get("n", 0)
+            if 0 < n < 8:
+                score -= 0.05
+
+    # --- Unknown activity penalty ---
+    # days_inactive == -1 means no ELO match history (all WTA players until results
+    # are recorded via --record). We can't verify the player is currently active,
+    # so apply a small penalty per player with unknown status.
+    if days_inactive == -1:
+        score -= 0.05
 
     # --- Validation penalty ---
     score -= validation.confidence_penalty

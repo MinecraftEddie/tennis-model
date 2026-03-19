@@ -96,11 +96,20 @@ def store_prediction(pick) -> str:
         "pick":          pick_name,
         "pick_odds":     pick_odds,
         "bookmaker":     pick.bookmaker,
-        "confidence":    pick.confidence,
-        "model_version": MODEL_VERSION,
-        "result":        None,
+        "confidence":       pick.confidence,
+        "cautious":         (getattr(pick, "evaluator_result", {}) or {}).get("recommended_action") == "send_with_caution",
+        "evaluator_result": getattr(pick, "evaluator_result", {}) or {},
+        "model_version":    MODEL_VERSION,
+        "result":           None,
         "winner":        None,
         "profit_loss":   None,
+        # CLV fields — populated separately via record_closing_odds()
+        # CLV = opening_odds / closing_odds - 1 for the pick side.
+        # Positive CLV = model found value before the market corrected; this is the
+        # primary signal that the model has genuine predictive edge, independent of P&L.
+        "closing_odds_a": None,
+        "closing_odds_b": None,
+        "clv":           None,
         "stored_at":     datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -108,6 +117,42 @@ def store_prediction(pick) -> str:
     _save(data)
     log.info(f"Prediction stored: {pred_id}  ({pick_name} @{pick_odds}  edge {pick_edge:+.1f}%)")
     return pred_id
+
+
+def record_closing_odds(prediction_id: str,
+                        closing_a: float,
+                        closing_b: float) -> dict:
+    """
+    Record closing line odds and compute CLV for the pick side.
+
+    CLV = opening_odds / closing_odds - 1
+    Positive CLV means the model backed a bet whose opening price was higher
+    than the closing price — i.e., the market moved in the model's direction.
+    A model with consistently positive CLV has genuine edge regardless of P&L noise.
+
+    Call this just before or after the match starts (closing line).
+    """
+    data = _load()
+    for pred in data["predictions"]:
+        if pred["id"] == prediction_id:
+            pred["closing_odds_a"] = closing_a
+            pred["closing_odds_b"] = closing_b
+            opening = (pred["best_odds_a"] if pred["pick"] == pred["player_a"]
+                       else pred["best_odds_b"])
+            closing = closing_a if pred["pick"] == pred["player_a"] else closing_b
+            if opening and closing and closing > 1.0:
+                pred["clv"] = round(opening / closing - 1, 4)
+                clv_str = f"{pred['clv']:+.1%}"
+            else:
+                pred["clv"] = None
+                clv_str = "N/A"
+            _save(data)
+            log.info(
+                f"Closing odds recorded: {prediction_id}  "
+                f"closing={closing:.2f}  CLV={clv_str}"
+            )
+            return pred
+    raise ValueError(f"Prediction '{prediction_id}' not found in {PREDICTIONS_FILE}")
 
 
 def record_result(prediction_id: str, winner: str) -> dict:
@@ -151,7 +196,7 @@ def record_result(prediction_id: str, winner: str) -> dict:
                     winner_ranking=pred.get("winner_ranking", 9999),
                     loser_ranking=pred.get("loser_ranking", 9999),
                 )
-                log.info(f"ELO updated: {_clean(pred['winner'])} beat {_clean(loser)}")
+                log.info(f"ELO updated: {pred['winner']} beat {loser}")
             except Exception as exc:
                 log.warning(f"ELO update skipped: {exc}")
 
@@ -203,6 +248,11 @@ def generate_report() -> dict:
     avg_edge = sum(_pick_edge(p) for p in settled) / total_bets
     avg_odds = sum(p["pick_odds"] for p in settled) / total_bets
 
+    # CLV stats (only bets where closing odds were recorded)
+    clv_bets = [p for p in settled if p.get("clv") is not None]
+    avg_clv          = sum(p["clv"] for p in clv_bets) / len(clv_bets) if clv_bets else None
+    positive_clv_ct  = sum(1 for p in clv_bets if p["clv"] > 0) if clv_bets else 0
+
     def _breakdown(key: str) -> dict:
         groups: dict = {}
         for p in settled:
@@ -222,18 +272,21 @@ def generate_report() -> dict:
         }
 
     report = {
-        "total_bets":    total_bets,
-        "wins":          wins,
-        "losses":        losses,
-        "win_rate":      round(win_rate, 3),
-        "total_profit":  round(total_profit, 3),
-        "roi":           round(roi, 3),
-        "avg_edge":      round(avg_edge, 1),
-        "avg_odds":      round(avg_odds, 2),
-        "by_surface":    _breakdown("surface"),
-        "by_tour":       _breakdown("tour"),
-        "by_confidence": _breakdown("confidence"),
-        "pending":       len(pending),
+        "total_bets":        total_bets,
+        "wins":              wins,
+        "losses":            losses,
+        "win_rate":          round(win_rate, 3),
+        "total_profit":      round(total_profit, 3),
+        "roi":               round(roi, 3),
+        "avg_edge":          round(avg_edge, 1),
+        "avg_odds":          round(avg_odds, 2),
+        "clv_tracked":       len(clv_bets),
+        "avg_clv":           round(avg_clv, 4) if avg_clv is not None else None,
+        "positive_clv_rate": round(positive_clv_ct / len(clv_bets), 3) if clv_bets else None,
+        "by_surface":        _breakdown("surface"),
+        "by_tour":           _breakdown("tour"),
+        "by_confidence":     _breakdown("confidence"),
+        "pending":           len(pending),
     }
 
     # ── Print formatted ────────────────────────────────────────────────────
@@ -243,6 +296,14 @@ def generate_report() -> dict:
     print(f"  ROI            : {roi:+.1%}")
     print(f"  Avg edge       : {avg_edge:+.1f}%")
     print(f"  Avg odds       : @{avg_odds:.2f}")
+
+    if clv_bets:
+        print(f"\n  CLV ({len(clv_bets)} bets with closing odds tracked):")
+        print(f"    Avg CLV      : {avg_clv:+.1%}")
+        print(f"    Positive CLV : {positive_clv_ct}/{len(clv_bets)}")
+        print(f"    (Positive CLV = model found value before market corrected)")
+    else:
+        print(f"\n  CLV: not yet tracked — use record_closing_odds() before match start")
 
     if report["by_surface"]:
         print(f"\n  By surface:")
@@ -262,4 +323,13 @@ def generate_report() -> dict:
                 print(f"    {conf:<8} {s['bets']:>3} bets  {s['wins']}/{s['bets']} wins  ROI {s['roi']:+.1%}")
 
     print(f"{sep}\n")
+
+    # ── Calibration report (segmented professional stats) ──────────────────
+    try:
+        from tennis_model.reporting.calibration import compute_calibration, print_calibration
+        cal = compute_calibration(all_preds)
+        print_calibration(cal)
+    except Exception as exc:
+        log.warning(f"Calibration report skipped: {exc}")
+
     return report

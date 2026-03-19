@@ -5,7 +5,22 @@ Converts service / return stats into hold%, set-win probability,
 and match-win probability.  Integrated into calculate_probability()
 as the "hold_break" component.
 """
+import logging
 from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
+
+# Plausible range for server's point-win probability (pre-surface-adjustment).
+# Values outside this range indicate corrupted or proxy-only stats.
+_PW_SERVE_MIN = 0.40
+_PW_SERVE_MAX = 0.80
+
+
+def _age_career_decay(age: int) -> float:
+    if age >= 41: return 0.25
+    if age >= 38: return 0.50
+    if age >= 35: return 0.75
+    return 1.0
 
 
 # Surface multipliers applied to the server's raw point-win probability
@@ -23,7 +38,8 @@ class ServiceStats:
     first_serve_won:  float = 0.72
     second_serve_won: float = 0.50
     break_pct:        float = 0.25
-    source:           str   = "proxy"   # "real" (Tennis Abstract) or "proxy" (hard_pct heuristic)
+    source:           str   = "proxy"        # "real" (Tennis Abstract) or "proxy" (hard_pct heuristic)
+    sample_type:      str   = ""             # e.g. "jsfrags_hard", "matchmx_career", "proxy_hard_pct"
 
 
 def extract_stats(player, surface: str = "hard") -> ServiceStats:
@@ -39,28 +55,49 @@ def extract_stats(player, surface: str = "hard") -> ServiceStats:
     surf = surface.lower()
     serve = getattr(player, "serve_stats", {})
 
-    if serve and serve.get("source") == "tennis_abstract":
-        # Prefer surface-specific stats; fall back to career if surface sample is small
-        real = serve.get(surf) or serve.get("career")
+    _real_sources = ("tennis_abstract", "tennis_abstract_wta")
+    if serve and serve.get("source") in _real_sources:
+        # Prefer surface-specific stats when n >= 5; fall back to career otherwise
+        surf_stats   = serve.get(surf)
+        career_stats = serve.get("career")
+        real = (surf_stats if surf_stats and surf_stats.get("n", 0) >= 5
+                else career_stats or surf_stats)
         if real:
             s1in  = real["first_serve_in"]
             s1won = real["first_serve_won"]
             s2won = real["second_serve_won"]
             p_srv = s1in * s1won + (1 - s1in) * s2won
-            return ServiceStats(
-                hold_pct         = round(p_srv, 4),
-                first_serve_in   = s1in,
-                first_serve_won  = s1won,
-                second_serve_won = s2won,
-                break_pct        = round(1.0 - p_srv, 4),
-                source           = "real",
+            if _PW_SERVE_MIN <= p_srv <= _PW_SERVE_MAX:
+                return ServiceStats(
+                    hold_pct         = round(p_srv, 4),
+                    first_serve_in   = s1in,
+                    first_serve_won  = s1won,
+                    second_serve_won = s2won,
+                    break_pct        = round(1.0 - p_srv, 4),
+                    source           = "real",
+                    sample_type      = real.get("sample_type", f"real_{surf}"),
+                )
+            log.warning(
+                f"extract_stats: point_win_on_serve={p_srv:.3f} out of range "
+                f"[{_PW_SERVE_MIN}, {_PW_SERVE_MAX}] for "
+                f"{getattr(player, 'short_name', '?')} "
+                f"(src={serve.get('source')}) — falling back to proxy"
+            )
+        else:
+            log.warning(
+                f"extract_stats: no usable real serve stats for "
+                f"{getattr(player, 'short_name', '?')} "
+                f"(src={serve.get('source')}) — falling back to proxy"
             )
 
     # Proxy fallback: derive from career hard-court win%
     hw = getattr(player, "hard_wins",   0)
     hl = getattr(player, "hard_losses", 0)
     total_hard = hw + hl
-    hard_pct = hw / total_hard if total_hard > 0 else 0.50
+    raw_hard_pct = hw / total_hard if total_hard > 0 else 0.50
+    # Age decay: shrink career hard% towards neutral (0.50) for players 35+
+    decay    = _age_career_decay(getattr(player, "age", None) or 26)
+    hard_pct = 0.50 + (raw_hard_pct - 0.50) * decay
 
     # Anchor: tour average hold ≈ 0.65; scale ±0.10 around it.
     hold_pct = 0.55 + hard_pct * 0.20   # range [0.55, 0.75]
@@ -78,6 +115,7 @@ def extract_stats(player, surface: str = "hard") -> ServiceStats:
         second_serve_won = second_serve_won,
         break_pct        = break_pct,
         source           = "proxy",
+        sample_type      = "proxy_hard_pct",
     )
 
 
