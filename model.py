@@ -1,4 +1,5 @@
 import logging
+import math
 from datetime import date
 
 from tennis_model.profiles import STATIC_PROFILES, WTA_PROFILES  # noqa: F401 (available for pipeline)
@@ -24,7 +25,7 @@ WEIGHTS = {
     "hold_break":         0.05,  # -0.05: serve stats also feed MC; halved to reduce double-counting
 }
 
-MARKET_WEIGHT = 0.15   # market blend: 85% model + 15% vig-stripped market
+from tennis_model.config.runtime_config import ELO_SHRINK, MARKET_WEIGHT, MC_WEIGHT  # noqa: E402
 # Note: 30% was too high — it deflated all computed edges by ~1.8% on a 6% vig ATP market,
 # requiring ~8.8% true model edge to clear the 7% threshold. 15% preserves genuine signal
 # while still anchoring against wildly mispriced profiles.
@@ -43,67 +44,79 @@ def _norm(a: float, b: float) -> tuple[float, float]:
 # Does NOT affect recent form or ranking factors.
 #   35-37 → 0.75,  38-40 → 0.50,  41+ → 0.25,  <35 → 1.0
 
-def _surface_form_score(pa, pb, surf):
+def _surface_form_score(pa, pb, surf, prior_a=0.5, prior_b=0.5):
     """Surface-adjusted recent form: 60% recent L10 win% + 40% career surface win%.
-    Career component is damped by age decay for players 35+ so that ancient results
-    do not override current evidence."""
-    def f(pl):
+    Both components anchor toward the ELO/ranking prior rather than toward 0.50:
+    - recent_pct: 70% signal + 30% ELO prior (damps extreme streaks).
+    - surface_pct: alpha=min(n/20, 1.0) sample weight — small samples pull heavily
+      toward ELO prior; ≥20 matches allow full signal. Age decay for 35+ is applied
+      around the ELO prior (not around neutral 0.50)."""
+    def f(pl, prior):
         decay = _age_career_decay(pl.age or 0)
         fm = pl.recent_form[-10:]
-        recent_pct = fm.count("W") / len(fm) if fm else 0.50
+        raw_recent = fm.count("W") / len(fm) if fm else prior
+        recent_pct = 0.70 * raw_recent + 0.30 * prior
         w = getattr(pl, f"{surf}_wins",   0)
         l = getattr(pl, f"{surf}_losses", 0)
-        raw_surface_pct = w / (w + l) if (w + l) > 0 else 0.50
-        # Shrink career surface% towards neutral (0.50) by age decay factor
-        surface_pct = 0.50 + (raw_surface_pct - 0.50) * decay
+        n = w + l
+        raw_surface_pct = w / n if n > 0 else prior
+        alpha = min(n / 20.0, 1.0)          # sample weight: n=0 → prior only; n≥20 → full signal
+        surface_pct = prior + alpha * (raw_surface_pct - prior) * decay
         return 0.6 * recent_pct + 0.4 * surface_pct
-    return _norm(f(pa), f(pb))
+    return _norm(f(pa, prior_a), f(pb, prior_b))
 
 
-def _surface_score(pa, pb, surf):
+def _surface_score(pa, pb, surf, prior_a=0.5, prior_b=0.5):
     """Career all-time win% on this surface, age-decayed towards 0.50 for players 35+."""
-    def p(pl):
+    def p(pl, prior):
         decay = _age_career_decay(pl.age or 0)
         w = getattr(pl, f"{surf}_wins",   0)
         l = getattr(pl, f"{surf}_losses", 0)
-        raw = w / (w + l) if (w + l) > 0 else 0.50
+        raw = w / (w + l) if (w + l) > 0 else prior
         return 0.50 + (raw - 0.50) * decay
-    return _norm(p(pa), p(pb))
+    return _norm(p(pa, prior_a), p(pb, prior_b))
 
-def _form_score(pa, pb):
+def _form_score(pa, pb, prior_a=0.5, prior_b=0.5):
     """Recent form with recency weighting: last 3 matches 3x, matches 4-7 2x, matches 8-10 1x."""
-    def f(pl):
+    def f(pl, prior):
         fm = pl.recent_form[-10:]
         if not fm:
-            return 0.50
+            return prior
         total_w = weighted_wins = 0
         for i, result in enumerate(reversed(fm)):  # i=0 is most recent
             w = 3 if i < 3 else (2 if i < 7 else 1)
             total_w += w
             if result == "W":
                 weighted_wins += w
-        return weighted_wins / total_w
-    return _norm(f(pa), f(pb))
+        raw = weighted_wins / total_w
+        return 0.70 * raw + 0.30 * prior  # inner shrink toward ELO prior (not 0.50)
+    ra, rb = _norm(f(pa, prior_a), f(pb, prior_b))
+    return 0.70 * ra + 0.30 * prior_a, 0.70 * rb + 0.30 * prior_b  # outer shrink toward ELO prior (beta=0.70)
 
-def _h2h_score(aw, bw):
-    return _norm(float(aw), float(bw)) if (aw+bw)>0 else (0.5, 0.5)
+def _h2h_score(aw, bw, prior_a=0.5, prior_b=0.5):
+    return _norm(float(aw), float(bw)) if (aw+bw)>0 else (prior_a, prior_b)
 
 def _exp_score(pa, pb):
-    """Career experience, age-decayed. A 45yo's 815 wins count as 815×0.25=204
-    so they don't overwhelm a younger player with far fewer but more recent wins."""
+    """Career experience, age-decayed then log-scaled.
+    log1p compresses large career-win totals so a veteran with 400 wins
+    does not get a 4x advantage over a player with 100 wins.
+    400 wins → log1p(400)≈6.0, 100 wins → log1p(100)≈4.6  (1.3x ratio, not 4x)."""
     def effective(p):
-        return max((p.career_wins or 0) * _age_career_decay(p.age or 0), 1.0)
+        raw = max((p.career_wins or 0) * _age_career_decay(p.age or 0), 1.0)
+        return math.log1p(raw)
     return _norm(effective(pa), effective(pb))
 
-def _physical_score(pa, pb):
+def _physical_score(pa, pb, prior_a=0.5, prior_b=0.5):
     """Physical suitability score.
     Age: piecewise curve — peak at 24-28, gentle decline to 33,
          steep 33-40, very steep 40+ (factor < 0.30 at age 40+).
     Height: minor linear bonus/penalty around 175cm baseline (±0.04 at ±12cm).
     Age is the primary multiplier; height is a small additive correction."""
-    def s(p):
+    def s(p, prior):
+        if p.age is None:
+            return prior
         h_bonus = (p.height_cm - 175) / 300 if p.height_cm else 0.0
-        a = p.age if p.age else 26
+        a = p.age
         if a <= 28:
             age_factor = 1.0                                    # peak window
         elif a <= 33:
@@ -113,18 +126,20 @@ def _physical_score(pa, pb):
         else:
             age_factor = max(0.30 - (a - 40) * 0.05, 0.05)     # 0.25 → floor 0.05
         return 0.5 * age_factor + h_bonus
-    return _norm(s(pa), s(pb))
+    return _norm(s(pa, prior_a), s(pb, prior_b))
 
-def _rest_score(pa, pb):
+def _rest_score(pa, pb, prior_a=0.5, prior_b=0.5):
     """Match density fatigue: ytd_matches / weeks_into_season.
     Higher density = more fatigued = lower rest score.
-    Falls back to neutral density 1.0 when ytd data is missing."""
+    Falls back to ranking-anchored prior when ytd data is missing (both None)."""
     weeks = max(date.today().isocalendar()[1], 1)
-    def density(pl):
-        ytd = (pl.ytd_wins or 0) + (pl.ytd_losses or 0)   # None = missing → treat as 0
-        d   = ytd / weeks if ytd > 0 else 1.0   # neutral fallback when missing
+    def density(pl, prior):
+        if pl.ytd_wins is None and pl.ytd_losses is None:
+            return prior                         # no ytd data → use ranking prior
+        ytd = (pl.ytd_wins or 0) + (pl.ytd_losses or 0)
+        d   = ytd / weeks if ytd > 0 else 1.0   # 0 matches played → neutral density
         return 1.0 / (1.0 + d)                  # invert: higher density → lower score
-    return _norm(density(pa), density(pb))
+    return _norm(density(pa, prior_a), density(pb, prior_b))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PROBABILITY MODEL
@@ -165,22 +180,49 @@ def calculate_probability(pa, pb, surface, h2h_a, h2h_b,
     elo_prob_a, elo_prob_b = _elo.elo_win_probability(
         _id_a, _id_b, surface, pa.ranking, pb.ranking
     )
+    # Fallback: if neither player has recorded ELO history, both default to 1500/1500
+    # and elo_prob collapses to 0.50/0.50, removing the main anti-underdog anchor.
+    # In that case, use vig-stripped market implied probability as the prior anchor.
+    if market_odds_a and market_odds_b:
+        _pa_elo = _elo.ratings.get(_id_a)
+        _pb_elo = _elo.ratings.get(_id_b)
+        if ((_pa_elo is None or _pa_elo.matches_played == 0) and
+                (_pb_elo is None or _pb_elo.matches_played == 0)):
+            _mkt_raw_a = 1.0 / market_odds_a
+            _mkt_raw_b = 1.0 / market_odds_b
+            _mkt_sum   = _mkt_raw_a + _mkt_raw_b
+            elo_prob_a = round(_mkt_raw_a / _mkt_sum, 4)
+            elo_prob_b = round(_mkt_raw_b / _mkt_sum, 4)
+            log.info(
+                f"ELO no history for both players — market implied used as ranking prior: "
+                f"{pa.short_name} {elo_prob_a:.1%}  {pb.short_name} {elo_prob_b:.1%}"
+            )
     _hb = compute_hold_break_prob(pa, pb, surface)
     comps = {
         "ranking":            (elo_prob_a, elo_prob_b),
-        "surface_form":       _surface_form_score(pa, pb, s),
-        "recent_form":        _form_score(pa, pb),
-        "h2h":                _h2h_score(h2h_a, h2h_b),
+        "surface_form":       _surface_form_score(pa, pb, s, elo_prob_a, elo_prob_b),
+        "recent_form":        _form_score(pa, pb, elo_prob_a, elo_prob_b),
+        "h2h":                _h2h_score(h2h_a, h2h_b, elo_prob_a, elo_prob_b),
         "tournament_exp":     _exp_score(pa, pb),
-        "career_surface_pct": _surface_score(pa, pb, s),
-        "physical":           _physical_score(pa, pb),
-        "rest":               _rest_score(pa, pb),
+        "career_surface_pct": _surface_score(pa, pb, s, elo_prob_a, elo_prob_b),
+        "physical":           _physical_score(pa, pb, elo_prob_a, elo_prob_b),
+        "rest":               _rest_score(pa, pb, elo_prob_a, elo_prob_b),
         "hold_break":         (_hb["prob_a"], _hb["prob_b"]),
     }
     sa = sum(WEIGHTS[k] * comps[k][0] for k in WEIGHTS)
     sb = sum(WEIGHTS[k] * comps[k][1] for k in WEIGHTS)
     prob_a, prob_b = _norm(sa, sb)
     log.info(f"Model → {pa.short_name} {prob_a:.1%} | {pb.short_name} {prob_b:.1%}")
+
+    # ELO prior anchor: shrink pure model probability 20% toward ELO prior.
+    # Prevents non-ranking factors from collectively drifting too far above the
+    # ranking signal. prob_a + prob_b = 1 is preserved since elo_prob_a + elo_prob_b = 1.
+    prob_a = ELO_SHRINK * prob_a + (1 - ELO_SHRINK) * elo_prob_a
+    prob_b = ELO_SHRINK * prob_b + (1 - ELO_SHRINK) * elo_prob_b
+    log.info(
+        f"ELO anchor ({int((1-ELO_SHRINK)*100)}% prior): "
+        f"{pa.short_name} {prob_a:.1%} | {pb.short_name} {prob_b:.1%}"
+    )
 
     # Market anchoring: blend model prob with vig-stripped market implied prob.
     # Prevents unrealistic edges when model diverges far from consensus price.
@@ -207,7 +249,6 @@ def calculate_probability(pa, pb, surface, h2h_a, h2h_b,
     #   Alcaraz/Dimitrov Hard  — analytical 65%, MC ~53%  (16% gap, no inversion)
     #   Alcaraz/Ruud Clay      — analytical 60%, MC ~42%  (18% gap, inverted)
     #   Eala/Siegemund Hard    — analytical 52%, MC ~66%  (14% gap)
-    MC_WEIGHT = 0.15
     pre_mc_prob_a = prob_a
     sim = run_simulation(pa, pb, surface, best_of=3, n_simulations=3000)
     mc_gap = abs(sim.win_prob_a - pre_mc_prob_a)

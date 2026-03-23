@@ -1,7 +1,7 @@
-from __future__ import annotations  # lazy annotation eval — MatchPick not yet in its own module
-
 import logging
 from typing import Optional
+
+from tennis_model.models import MatchPick, PlayerProfile  # noqa: F401
 
 log = logging.getLogger(__name__)
 
@@ -98,10 +98,9 @@ def format_pick_card(pick: MatchPick, number: int = 1) -> str:
             f"   {pa.short_name}: {pa.data_source}  |  {pb.short_name}: {pb.data_source}",
         ])
 
-    if pick.pick_player == pb.short_name:
-        fav, prob, fo, mo, edge = pb.short_name, pick.prob_b, pick.fair_odds_b, pick.market_odds_b, pick.edge_b
-    else:
-        fav, prob, fo, mo, edge = pa.short_name, pick.prob_a, pick.fair_odds_a, pick.market_odds_a, pick.edge_a
+    picked = pick.require_picked_side()
+    fav, prob, fo, mo, edge = (picked["player"].short_name, picked["prob"],
+                                picked["fair_odds"], picked["market_odds"], picked["edge"])
 
     edge_str = (f"+{edge:.1f}%" if edge and edge > 0 else f"{edge:.1f}%" if edge else "— no market odds")
     mkt_str  = f"@{mo}" if mo else "—"
@@ -124,12 +123,8 @@ def format_pick_card(pick: MatchPick, number: int = 1) -> str:
         lines.append(f"⚠️  {w}")
     if pick.simulation:
         sim = pick.simulation
-        if pick.pick_player == pick.player_b.short_name:
-            mc_name = pick.player_b.short_name
-            mc_prob = sim['win_prob_b']
-        else:
-            mc_name = pick.player_a.short_name
-            mc_prob = sim['win_prob_a']
+        mc_name = picked["player"].short_name
+        mc_prob = sim['win_prob_b'] if picked["side"] == "B" else sim['win_prob_a']
         lines.append(
             f"🎲 MC: {mc_name} wins {mc_prob*100:.0f}%"
             f" | 3-sets {sim['three_set_prob']*100:.0f}%"

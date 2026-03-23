@@ -292,7 +292,7 @@ def test_risk_flags():
     Test risk flag detection functions.
     Run via: python -m tennis_model.evaluator.risk_flags --test
     """
-    from tennis_model.pipeline import PlayerProfile, MatchPick
+    from tennis_model.models import PlayerProfile, MatchPick
     
     print("\n" + "="*80)
     print("RISK_FLAGS.PY TEST SUITE")

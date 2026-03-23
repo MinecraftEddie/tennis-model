@@ -80,11 +80,10 @@ print(f"RANKED BY EDGE  (threshold {THRESHOLD}%)")
 print("═"*60)
 alerts_sent = 0
 for rank, (edge, pick) in enumerate(results, 1):
-    pa, pb = pick.player_a, pick.player_b
-    if pick.pick_player == pb.short_name:
-        pick_name, pick_odds = pb.short_name, pick.market_odds_b
-    else:
-        pick_name, pick_odds = pa.short_name, pick.market_odds_a
+    pa, pb    = pick.player_a, pick.player_b
+    picked    = pick.require_picked_side()
+    pick_name = picked["player"].short_name
+    pick_odds = picked["market_odds"]
     edge_str = f"+{edge:.1f}%" if edge > 0 else f"{edge:.1f}%"
     # Alert already sent by maybe_alert() inside run_match() when is_value=True.
     # Use filter_reason to determine whether the alert actually fired.

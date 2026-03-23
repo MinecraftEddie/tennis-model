@@ -5,6 +5,11 @@ Reads MatchPick, applies tennis rules, returns alert decision JSON.
 import logging
 from typing import Optional
 
+from tennis_model.config.runtime_config import (
+    LONGSHOT_GUARD_THRESHOLD,
+    UNDERDOG_EDGE_THRESHOLD_LOW_ODDS,
+    UNDERDOG_EDGE_THRESHOLD_HIGH_ODDS,
+)
 from tennis_model.evaluator.rules import (
     evaluate_surface_fit,
     evaluate_serve_consistency,
@@ -135,6 +140,26 @@ def evaluate(pick, match_context: Optional[dict] = None) -> dict:
         )
 
     # ──────────────────────────────────────────────────────────────────────────────
+    # LONGSHOT GUARD  (market_prob < 0.15  →  odds > ~6.67)
+    # At extreme odds, even moderate absolute overestimation produces enormous
+    # % edges (e.g. +14pp over market × 10.00 odds = +140% edge).
+    # Watchlist only — do not send as a normal alert.
+    # Revert: remove this block to restore pre-guard behaviour.
+    # ──────────────────────────────────────────────────────────────────────────────
+    _pick_odds = (pick.market_odds_a if pick_player == pick.player_a.short_name
+                  else pick.market_odds_b) or 0.0
+    if _pick_odds > 0 and (1.0 / _pick_odds) < LONGSHOT_GUARD_THRESHOLD:
+        return build_alert_decision(
+            match_id=match_id,
+            alert_level="low",
+            confidence=0.0,
+            recommended_action="watchlist",
+            reasons=[f"Longshot guard: market prob {1.0/_pick_odds:.1%} < 15% (odds @{_pick_odds:.2f})"],
+            risk_flags=["LONGSHOT_GUARD"],
+            short_message=f"Longshot guard: @{_pick_odds:.2f} odds — watchlist only",
+        )
+
+    # ──────────────────────────────────────────────────────────────────────────────
     # STEP 2: Evaluate tennis rules (basic + advanced)
     # ──────────────────────────────────────────────────────────────────────────────
     
@@ -223,7 +248,10 @@ def evaluate(pick, match_context: Optional[dict] = None) -> dict:
     
     edge_boost = min(0.15, edge_dec * 0.5)  # cap edge boost (edge_dec is decimal)
 
-    base_confidence = (avg_rule_score + model_confidence_boost + edge_boost) / 2.0
+    # avg_rule_score is already in [0, 1]; boosts are honest additive signals.
+    # The previous / 2.0 crushed all scores into "low", causing the hybrid cautious
+    # mode to override rule classification for almost every match.
+    base_confidence = min(avg_rule_score + model_confidence_boost + edge_boost, 1.0)
     
     # ──────────────────────────────────────────────────────────────────────────────
     # STEP 4: Adjust for live match context
@@ -374,10 +402,33 @@ def evaluate(pick, match_context: Optional[dict] = None) -> dict:
     }
     no_hard_blockers = not any(f in risk_flags for f in _HARD_BLOCKERS)
     if (recommended_action in ("ignore", "watchlist")
-            and 0.07 <= edge_dec <= 0.35
+            and 0.06 <= edge_dec <= 0.35
             and no_hard_blockers
             and final_confidence > 0.30):
         recommended_action = "send_with_caution"
+
+    # ──────────────────────────────────────────────────────────────────────────────
+    # STEP 6c: Underdog alert threshold
+    # If the picked side is the market underdog, require a stricter minimum edge
+    # before sending a normal alert.  Applies after hybrid cautious mode so it
+    # cannot be bypassed by Step 6b.
+    #   odds <= 3.00 → edge must be >= 0.15
+    #   odds >  3.00 → edge must be >= 0.18
+    # Revert: remove this block to restore pre-threshold behaviour.
+    # ──────────────────────────────────────────────────────────────────────────────
+    if recommended_action in ("send", "send_with_caution"):
+        _opp_odds = (pick.market_odds_b if pick_player == pick.player_a.short_name
+                     else pick.market_odds_a) or 0.0
+        _is_underdog = _pick_odds > 0 and _opp_odds > 0 and _pick_odds > _opp_odds
+        if _is_underdog:
+            _underdog_min_edge = (UNDERDOG_EDGE_THRESHOLD_HIGH_ODDS
+                                   if _pick_odds > 3.00
+                                   else UNDERDOG_EDGE_THRESHOLD_LOW_ODDS)
+            if edge_dec < _underdog_min_edge:
+                recommended_action = "watchlist"
+                reasons.append(
+                    f"Underdog threshold: @{_pick_odds:.2f} requires edge >= {_underdog_min_edge:.0%}, got {edge_dec:.0%}"
+                )
 
     # ──────────────────────────────────────────────────────────────────────────────
     # STEP 7: Build short message

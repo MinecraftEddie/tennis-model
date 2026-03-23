@@ -1,0 +1,65 @@
+{
+  "odds_api_key": "50147047eafa624355b718e9eac25d3e",
+  "telegram": {
+    "bot_token": "YOUR_BOT_TOKEN_HERE",
+    "chat_id": "YOUR_CHAT_ID_HERE",
+    "edge_threshold": 7.0
+  },
+  "matches": [
+    {
+      "match": "A. Eala vs L. Siegemund",
+      "tournament": "Miami Open",
+      "level": "WTA 1000",
+      "surface": "Hard",
+      "tour": "wta",
+      "odds_a": 1.56,
+      "odds_b": 2.70,
+      "bookmaker": "Pinnacle",
+      "odds_timestamp": "2026-03-19T00:00:00Z"
+    },
+    {
+      "match": "K. Boulter vs C. Tauson",
+      "tournament": "Miami Open",
+      "level": "WTA 1000",
+      "surface": "Hard",
+      "tour": "wta",
+      "odds_a": 2.85,
+      "odds_b": 1.48,
+      "bookmaker": "Pinnacle",
+      "odds_timestamp": "2026-03-19T00:00:00Z"
+    },
+    {
+      "match": "M. Andreeva vs M. Kessler",
+      "tournament": "Miami Open",
+      "level": "WTA 1000",
+      "surface": "Hard",
+      "tour": "wta",
+      "odds_a": 1.24,
+      "odds_b": 4.50,
+      "bookmaker": "Pinnacle",
+      "odds_timestamp": "2026-03-19T00:00:00Z"
+    },
+    {
+      "match": "E. Jacquemot vs M. Bouzkova",
+      "tournament": "Miami Open",
+      "level": "WTA 1000",
+      "surface": "Hard",
+      "tour": "wta",
+      "odds_a": 3.60,
+      "odds_b": 1.37,
+      "bookmaker": "Pinnacle",
+      "odds_timestamp": "2026-03-19T00:00:00Z"
+    },
+    {
+      "match": "M. Linette vs I. Swiatek",
+      "tournament": "Miami Open",
+      "level": "WTA 1000",
+      "surface": "Hard",
+      "tour": "wta",
+      "odds_a": 10.50,
+      "odds_b": 1.08,
+      "bookmaker": "Pinnacle",
+      "odds_timestamp": "2026-03-19T00:00:00Z"
+    }
+  ]
+}

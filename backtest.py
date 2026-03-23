@@ -10,19 +10,55 @@ data/predictions.json is the single source of truth.
 import json
 import logging
 import os
+import re
 from datetime import datetime, date
 from typing import Optional
+
+from tennis_model.config.runtime_config import (
+    MODEL_VERSION, ELO_SHRINK, MARKET_WEIGHT, MC_WEIGHT, PROB_FLOOR,
+    LONGSHOT_GUARD_THRESHOLD,
+    UNDERDOG_EDGE_THRESHOLD_LOW_ODDS, UNDERDOG_EDGE_THRESHOLD_HIGH_ODDS,
+)
 
 log = logging.getLogger(__name__)
 
 # data/ lives one level above tennis_model/  →  Downloads/data/
 DATA_DIR         = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 PREDICTIONS_FILE = os.path.join(DATA_DIR, "predictions.json")
-MODEL_VERSION    = "2.0"
+
+# Frozen at import time — all values sourced from config/runtime_config.py.
+_MODEL_SNAPSHOT = {
+    "model_version":                     MODEL_VERSION,
+    "elo_shrink":                        ELO_SHRINK,
+    "market_weight":                     MARKET_WEIGHT,
+    "mc_weight":                         MC_WEIGHT,
+    "prob_floor":                        PROB_FLOOR,
+    "longshot_guard_threshold":          LONGSHOT_GUARD_THRESHOLD,
+    "underdog_edge_threshold_low_odds":  UNDERDOG_EDGE_THRESHOLD_LOW_ODDS,
+    "underdog_edge_threshold_high_odds": UNDERDOG_EDGE_THRESHOLD_HIGH_ODDS,
+}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # INTERNAL HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _norm(s: str) -> str:
+    """Lowercase, collapse whitespace, remove . and - (tennis name punctuation)."""
+    return re.sub(r"\s+", " ", re.sub(r"[.\-]", " ", s.lower())).strip()
+
+
+def _name_matches(candidate: str, stored: str) -> bool:
+    """Word-token containment match.
+
+    All words in *candidate* must appear in *stored* as whole tokens.
+    'Sinner'   matches 'J. Sinner'         → {'sinner'} ⊆ {'j','sinner'}  ✓
+    'Li'    does NOT match 'Elina'          → {'li'} ⊄ {'elina'}           ✓
+    'King'  does NOT match 'Dekking'        → {'king'} ⊄ {'dekking'}       ✓
+    """
+    cw = set(_norm(candidate).split())
+    sw = set(_norm(stored).split())
+    return bool(cw) and cw.issubset(sw)
+
 
 def _ensure_data_dir() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -63,9 +99,10 @@ def store_prediction(pick) -> str:
     player_b = pick.player_b.full_name or pick.player_b.short_name
     pred_id  = _make_id(today, player_a, player_b)
 
-    pick_name = pick.pick_player or player_a
-    pick_odds = pick.market_odds_a if pick_name == player_a else pick.market_odds_b
-    pick_edge = pick.edge_a if pick_name == player_a else pick.edge_b or 0.0
+    picked    = pick.require_picked_side()
+    pick_name = picked["player"].short_name
+    pick_odds = picked["market_odds"]
+    pick_edge = picked["edge"] or 0.0
 
     data = _load()
 
@@ -100,6 +137,7 @@ def store_prediction(pick) -> str:
         "cautious":         (getattr(pick, "evaluator_result", {}) or {}).get("recommended_action") == "send_with_caution",
         "evaluator_result": getattr(pick, "evaluator_result", {}) or {},
         "model_version":    MODEL_VERSION,
+        "model_snapshot":   _MODEL_SNAPSHOT,
         "result":           None,
         "winner":        None,
         "profit_loss":   None,
@@ -158,20 +196,44 @@ def record_closing_odds(prediction_id: str,
 def record_result(prediction_id: str, winner: str) -> dict:
     """
     Record the actual match result.
-    winner: player name (substring match accepted, e.g. "Galfi").
+    winner: player name, matched by word-token containment (e.g. "Sinner" matches
+    "J. Sinner"; partial last names work, but "Li" will NOT falsely match "Elina").
     Updates result, winner, profit_loss fields and saves.
     Returns the updated prediction dict.
     """
     data = _load()
     for pred in data["predictions"]:
         if pred["id"] == prediction_id:
-            # Resolve to A_WIN or B_WIN via case-insensitive substring match
-            if winner.lower() in pred["player_a"].lower() or pred["player_a"].lower() in winner.lower():
+            log.info(f"Settling {prediction_id} from {PREDICTIONS_FILE}")
+            # Resolve to A_WIN or B_WIN via word-token containment match
+            match_a = _name_matches(winner, pred["player_a"])
+            match_b = _name_matches(winner, pred["player_b"])
+
+            if match_a and not match_b:
                 pred["result"] = "A_WIN"
                 pred["winner"] = pred["player_a"]
-            else:
+            elif match_b and not match_a:
                 pred["result"] = "B_WIN"
                 pred["winner"] = pred["player_b"]
+            elif match_a and match_b:
+                log.warning(
+                    f"Ambiguous winner {winner!r}: matches both "
+                    f"{pred['player_a']!r} and {pred['player_b']!r} — provide a more specific name"
+                )
+                raise ValueError(
+                    f"Ambiguous winner {winner!r}: matches both "
+                    f"player_a={pred['player_a']!r} and player_b={pred['player_b']!r}. "
+                    f"Provide a more specific name."
+                )
+            else:
+                log.warning(
+                    f"Winner {winner!r} matches neither player: "
+                    f"player_a={pred['player_a']!r}, player_b={pred['player_b']!r} — skipping settlement"
+                )
+                raise ValueError(
+                    f"Winner {winner!r} matches neither player: "
+                    f"player_a={pred['player_a']!r}, player_b={pred['player_b']!r}"
+                )
 
             # Profit/loss: net units per 1 unit staked
             if pred["pick"] == pred["winner"]:
@@ -202,6 +264,7 @@ def record_result(prediction_id: str, winner: str) -> dict:
 
             return pred
 
+    log.warning(f"Settlement failed: prediction {prediction_id!r} not found in {PREDICTIONS_FILE}")
     raise ValueError(f"Prediction '{prediction_id}' not found in {PREDICTIONS_FILE}")
 
 

@@ -1,4 +1,5 @@
 from tennis_model.validation import ValidationResult
+from tennis_model.confidence_caps import cap_data_availability
 
 
 def compute_confidence(pa, pb, surface: str,
@@ -9,6 +10,9 @@ def compute_confidence(pa, pb, surface: str,
 
     score = 0.0
     surf = surface.lower()
+
+    # --- Data availability (data_source + surface_n + ytd) — capped below ---
+    _pre_data = score
 
     # --- Data source quality ---
     source_scores = {
@@ -46,6 +50,10 @@ def compute_confidence(pa, pb, surface: str,
         if ytd >= 15:   score += 0.10
         elif ytd >= 8:  score += 0.05
         elif ytd == 0:  score -= 0.20
+
+    # --- Cap data availability contribution ---
+    _data_avail = score - _pre_data
+    score = _pre_data + cap_data_availability(_data_avail)
 
     # --- Edge strength ---
     if edge >= 0.25:    score += 0.20
@@ -115,4 +123,17 @@ def compute_confidence(pa, pb, surface: str,
         "MEDIUM"    if score >= 0.40 else
         "LOW"
     )
-    return raw if raw != "VERY HIGH" or cap == "VERY HIGH" else cap
+    result = raw if raw != "VERY HIGH" or cap == "VERY HIGH" else cap
+
+    # --- Hard gate: HIGH requires minimum pick quality ---
+    # Data-availability bonuses (data_source + surface_n + ytd) can reach +0.90
+    # for two well-known players, making HIGH achievable with near-zero edge or
+    # conviction.  These two gates enforce a floor on actual pick quality signals,
+    # independently of the total score.
+    if result == "HIGH":
+        if gap < 0.08:    # model within 8pp of 50/50 — not a confident prediction
+            result = "MEDIUM"
+        if edge < 0.12:   # less than 12% edge — not enough market inefficiency
+            result = "MEDIUM"
+
+    return result

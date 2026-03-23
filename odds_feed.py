@@ -104,14 +104,22 @@ def get_live_odds(player_a: str, player_b: str, tour: str = "wta") -> dict | Non
         log.warning(f"No active {tour.upper()} sport keys found — skipping live odds fetch")
         return None
 
+    log.info(
+        f"Live odds search: '{player_a}' vs '{player_b}' "
+        f"across {len(sport_keys)} {tour.upper()} key(s): {sport_keys}"
+    )
+
     params = {
         "apiKey":      api_key,
-        "regions":     "eu",
+        "regions":     "eu,us,uk,au",  # was "eu" — broaden to maximise bookmaker coverage
         "markets":     "h2h",
         "oddsFormat":  "decimal",
     }
 
     # Search across every active tournament for this tour
+    _total_events = 0
+    _candidates_seen: list[str] = []  # collect for diagnostic log when no match found
+
     for sport in sport_keys:
         url = _ODDS_API_BASE.format(sport=sport)
         try:
@@ -128,10 +136,15 @@ def get_live_odds(player_a: str, player_b: str, tour: str = "wta") -> dict | Non
             log.warning(f"Error fetching {sport}: {exc} — skipping")
             continue
 
+        log.info(f"  {sport}: {len(events)} event(s)")
+        _total_events += len(events)
+
         # Find the matching event within this tournament
         for event in events:
             home = event.get("home_team", "")
             away = event.get("away_team", "")
+            if home and away:
+                _candidates_seen.append(f"{home} vs {away}")
             # Both players must match (order can be either way)
             if not ((_names_match(home, player_a) and _names_match(away, player_b)) or
                     (_names_match(home, player_b) and _names_match(away, player_a))):
@@ -182,10 +195,19 @@ def get_live_odds(player_a: str, player_b: str, tour: str = "wta") -> dict | Non
                 "timestamp": timestamp,
             }
 
-    log.warning(
-        f"No live odds found for '{player_a}' vs '{player_b}' "
-        f"({tour.upper()}) — searched {len(sport_keys)} tournament(s)"
-    )
+    if _total_events == 0:
+        log.warning(
+            f"No live odds for '{player_a}' vs '{player_b}' ({tour.upper()}) — "
+            f"slate empty across {len(sport_keys)} key(s): {sport_keys} "
+            f"(all matches may have completed or no markets open yet)"
+        )
+    else:
+        preview = _candidates_seen[:12]
+        log.warning(
+            f"No live odds for '{player_a}' vs '{player_b}' ({tour.upper()}) — "
+            f"name not matched in {_total_events} event(s) across {len(sport_keys)} key(s); "
+            f"candidates seen: {preview}"
+        )
     return None
 
 
@@ -207,13 +229,16 @@ def fetch_slate(api_key: str | None = None) -> dict[str, list[dict]]:
     result: dict[str, list[dict]] = {"atp": [], "wta": []}
     params = {
         "apiKey":     api_key,
-        "regions":    "eu",
+        "regions":    "eu,us,uk,au",  # was "eu" — broaden to maximise bookmaker coverage
         "markets":    "h2h",
         "oddsFormat": "decimal",
     }
 
+    _any_sport_keys = False
     for tour in ("atp", "wta"):
         sport_keys = _active_tennis_sport_keys(api_key, tour)
+        if sport_keys:
+            _any_sport_keys = True
         for sport in sport_keys:
             url = _ODDS_API_BASE.format(sport=sport)
             try:
@@ -224,6 +249,7 @@ def fetch_slate(api_key: str | None = None) -> dict[str, list[dict]]:
                 log.warning(f"fetch_slate: error fetching {sport}: {exc}")
                 continue
 
+            log.info(f"fetch_slate: {sport} → {len(events)} event(s)")
             for event in events:
                 home = event.get("home_team", "")
                 away = event.get("away_team", "")
@@ -264,9 +290,30 @@ def fetch_slate(api_key: str | None = None) -> dict[str, list[dict]]:
                     "commence_time": event.get("commence_time", ""),
                 })
 
-    log.info(
-        f"fetch_slate: {len(result['atp'])} ATP, {len(result['wta'])} WTA events"
-    )
+    total_atp = len(result["atp"])
+    total_wta = len(result["wta"])
+    if total_atp + total_wta == 0:
+        if _any_sport_keys:
+            log.warning(
+                "fetch_slate: 0 events returned despite active sport keys — "
+                "possible API failure or genuinely empty slate"
+            )
+        else:
+            log.warning("fetch_slate: 0 events — no active sport keys found for ATP or WTA")
+    else:
+        log.info(f"fetch_slate: {total_atp} ATP, {total_wta} WTA events total")
+
+    from datetime import date as _dt, timedelta as _td
+    _tomorrow = (_dt.today() + _td(days=1)).strftime("%Y-%m-%d")
+    _tmrw = [e for t in ("atp", "wta") for e in result[t]
+             if e.get("commence_time", "").startswith(_tomorrow)]
+    if _tmrw:
+        log.info(f"fetch_slate: tomorrow ({_tomorrow}) — {len(_tmrw)} event(s):")
+        for _e in _tmrw:
+            log.info(f"  [{_e['sport_key']}] {_e['player_a']} vs {_e['player_b']}  {_e['commence_time']}")
+    else:
+        log.info(f"fetch_slate: no events scheduled for tomorrow ({_tomorrow})")
+
     return result
 
 

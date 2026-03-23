@@ -3,6 +3,8 @@ Tennis-specific evaluation rules.
 Surface fit, serve consistency, return quality, break points, fatigue, etc.
 """
 
+from tennis_model.evaluator.serve_utils import _get_serve_metric
+
 
 def evaluate_surface_fit(pick, surface: str) -> tuple[float, str]:
     """
@@ -255,8 +257,10 @@ def evaluate_serve_stability(pick) -> tuple[float, str]:
     _real_sources = ("tennis_abstract", "tennis_abstract_wta")
 
     if serve_stats.get("source") in _real_sources:
-        first_serve = serve_stats.get("first_serve_in", serve_stats.get("first_serve_pct", 0.60))
-        hold_pct = serve_stats.get("hold_serve_pct", serve_stats.get("serve_win_pct", 0.85))
+        first_serve = _get_serve_metric(serve_stats, "first_in_pct") \
+                   or _get_serve_metric(serve_stats, "first_serve_in") \
+                   or 0.60
+        hold_pct = _get_serve_metric(serve_stats, "serve_win_pct") or 0.85
         
         # Stability score: high first serve + high hold = stable
         stability = (first_serve * 0.4 + hold_pct * 0.6)
@@ -308,8 +312,12 @@ def evaluate_return_pressure(pick) -> tuple[float, str]:
     opp_serve_stats = opponent.serve_stats or {}
     tour = getattr(pick, "tour", "wta").lower()
     default_hold = 0.65 if tour == "wta" else 0.82
-    opp_hold = opp_serve_stats.get("hold_serve_pct", default_hold)
-    opp_break_opportunity = 1.0 - opp_hold
+    opp_hold_pct = _get_serve_metric(opp_serve_stats, "hold_pct")
+    if opp_hold_pct is None:
+        opp_hold_pct = _get_serve_metric(opp_serve_stats, "hold_serve_pct")
+    if opp_hold_pct is None:
+        opp_hold_pct = default_hold
+    opp_break_opportunity = 1.0 - opp_hold_pct
     
     # Player return effectiveness (from recent wins against tough opponents)
     recent = player.recent_form or []
@@ -342,10 +350,14 @@ def evaluate_break_point_performance(pick) -> tuple[float, str]:
         player = pick.player_b
     
     serve_stats = player.serve_stats or {}
-    
-    # Break conversion % (from Tennis Abstract)
-    break_conv = serve_stats.get("break_conv_pct", 0.25)
-    break_saved = serve_stats.get("break_saved_pct", 0.75)
+
+    # Break point stats — break_saved_pct present in WTA jsfrags data;
+    # break_conv_pct rarely stored, fall back to tour average (0.42 WTA, 0.44 ATP)
+    tour = getattr(pick, "tour", "wta").lower()
+    default_conv  = 0.42 if tour == "wta" else 0.44
+    default_saved = 0.60 if tour == "wta" else 0.65
+    break_conv  = _get_serve_metric(serve_stats, "break_conv_pct")  or default_conv
+    break_saved = _get_serve_metric(serve_stats, "break_saved_pct") or default_saved
     
     # Clutch score: higher conversion + higher saved = reliable
     clutch = (break_conv * 0.5 + break_saved * 0.5)
@@ -454,7 +466,7 @@ def test_rules():
     Test all rule evaluation functions with sample data.
     Run via: python -m tennis_model.evaluator.rules --test
     """
-    from tennis_model.pipeline import PlayerProfile, MatchPick
+    from tennis_model.models import PlayerProfile, MatchPick
     
     print("\n" + "="*80)
     print("RULES.PY TEST SUITE")

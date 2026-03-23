@@ -1,0 +1,42 @@
+{
+  "laura_siegemund": {
+    "player_id": "laura_siegemund",
+    "overall": 1516.0,
+    "hard": 1516.0,
+    "clay": 1500.0,
+    "grass": 1500.0,
+    "recent": 1524.0,
+    "last_updated": "2026-03-18",
+    "matches_played": 1
+  },
+  "petra_marcinko": {
+    "player_id": "petra_marcinko",
+    "overall": 1484.0,
+    "hard": 1484.0,
+    "clay": 1500.0,
+    "grass": 1500.0,
+    "recent": 1476.0,
+    "last_updated": "2026-03-18",
+    "matches_played": 1
+  },
+  "katie_boulter": {
+    "player_id": "katie_boulter",
+    "overall": 1516.0,
+    "hard": 1516.0,
+    "clay": 1500.0,
+    "grass": 1500.0,
+    "recent": 1524.0,
+    "last_updated": "2026-03-18",
+    "matches_played": 1
+  },
+  "jessica_bouzas_maneiro": {
+    "player_id": "jessica_bouzas_maneiro",
+    "overall": 1484.0,
+    "hard": 1484.0,
+    "clay": 1500.0,
+    "grass": 1500.0,
+    "recent": 1476.0,
+    "last_updated": "2026-03-18",
+    "matches_played": 1
+  }
+}

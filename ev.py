@@ -1,13 +1,11 @@
 import logging
 from dataclasses import dataclass
 from tennis_model.validation import ValidationResult
+from tennis_model.config.runtime_config import (
+    PROB_FLOOR, SUSPICIOUS_EDGE_THRESHOLD, MIN_ODDS, MAX_ODDS,
+)
 
 log = logging.getLogger(__name__)
-
-SUSPICIOUS_EDGE_THRESHOLD = 0.50   # edges above 50% are flagged for manual review
-MIN_ODDS   = 1.50   # hard floor: below this, vig kills edge sustainability
-MAX_ODDS   = 3.00   # soft ceiling: warn; variable threshold already handles edge requirement
-PROB_FLOOR = 0.40   # minimum model probability to bet (no deep underdogs)
 
 
 @dataclass

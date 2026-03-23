@@ -40,11 +40,39 @@ def validate_match(pa, pb, surface,
             v.confidence_penalty += 0.05
 
     # 3. Data source quality
-    bad_sources = ("unknown", "fallback")
+    # P0: hard fail only when identity is unresolved (player truly unknown).
+    #     Degraded stats (rate-limited, timeout, stale, estimated defaults) are
+    #     warnings with a confidence penalty — they do NOT block the pipeline.
+    _degraded_sources = (
+        "degraded_ratelimit",
+        "degraded_timeout",
+        "degraded_empty",
+        "wta_estimated",
+        "fallback",
+    )
     for p in [pa, pb]:
-        if p.data_source in bad_sources:
+        _identity = getattr(p, "identity_source", "unresolved")
+        if _identity == "unresolved":
+            # Identity not resolved → hard fail (preserves pre-P0 behavior)
             v.errors.append(
-                f"{p.short_name}: unreliable data source ({p.data_source})")
+                f"{p.short_name}: identity unresolved ({p.data_source}) "
+                f"[VALIDATION_SOURCE_UNKNOWN]"
+            )
+        elif p.data_source in _degraded_sources:
+            # Identity known, stats degraded → warn + penalise, pipeline continues
+            v.warnings.append(
+                f"{p.short_name}: degraded data source ({p.data_source}) "
+                f"[VALIDATION_PROFILE_DEGRADED]"
+            )
+            v.confidence_penalty += 0.15
+        elif p.data_source == "unknown":
+            # data_source wasn't updated despite resolved identity — safety net:
+            # treat as degraded rather than silently failing
+            v.warnings.append(
+                f"{p.short_name}: data_source='unknown' with identity={_identity} — "
+                f"treating as degraded [VALIDATION_PROFILE_DEGRADED]"
+            )
+            v.confidence_penalty += 0.15
 
     # 4. Odds sanity check
     if market_odds_a and market_odds_b:

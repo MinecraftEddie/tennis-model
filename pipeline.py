@@ -3,15 +3,21 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Optional
 
 import requests
 
+from tennis_model.models import PlayerProfile, MatchPick, SERVE_BOUNDS
+from tennis_model.ingestion.tennis_abstract import (
+    _parse_ta_serve_stats,
+    _parse_ta_wta_serve_stats,
+    _parse_ta_wta_full_profile,
+)
 from tennis_model.profiles import STATIC_PROFILES, WTA_PROFILES, PLAYER_ID_MAP
 from tennis_model.elo import get_elo_engine, canonical_id
 from tennis_model.model import calculate_probability, fair_odds, edge_pct
+from tennis_model.probability_adjustments import shrink_toward_market
 from tennis_model.validation import validate_match
 from tennis_model.confidence import compute_confidence
 from tennis_model.ev import compute_ev, EVResult
@@ -21,6 +27,18 @@ from tennis_model.formatter import (
 )
 from tennis_model.telegram import send_telegram, maybe_alert
 from tennis_model.odds_feed import get_live_odds, fetch_slate
+# P1: extracted helpers
+from tennis_model.ingestion.identity import resolve_identity
+from tennis_model.ingestion.http_utils import fetch_with_retry
+from tennis_model.ingestion.profile_cache import (
+    profile_cache_key       as _profile_cache_key,
+    load_cached_profile     as _load_cached_profile,
+    save_cached_profile     as _save_cached_profile,
+    profile_to_cacheable    as _profile_to_cacheable,
+    apply_cached_to_profile as _apply_cached_to_profile,
+)
+# P2: clean profile entry point + quality classification
+from tennis_model.ingestion.profile_fetcher import fetch_profile_with_quality
 import tennis_model.formatter as _fmt
 import tennis_model.telegram as _tg
 
@@ -43,65 +61,6 @@ ATP_STATS_API   = "https://www.atptour.com/-/ajax/playerdashboard/GetPlayerStats
 ATP_RESULTS_API = "https://www.atptour.com/-/ajax/playerdashboard/GetPlayerMatchResults?playerId={pid}&year={year}"
 ATP_H2H_API     = "https://www.atptour.com/-/ajax/playerdashboard/GetH2HMatches?playerId={pid_a}&opponentId={pid_b}"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# DATA STRUCTURES
-# ──────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class PlayerProfile:
-    short_name:       str
-    full_name:        str            = ""
-    atp_id:           str            = ""
-    slug:             str            = ""
-    ranking:          int            = 9999
-    age:              Optional[int]  = None   # None = fetch failed / unknown
-    height_cm:        Optional[int]  = None   # None = fetch failed / unknown
-    plays:            str            = "Right-handed"
-    turned_pro:       Optional[int]  = None   # metadata only — not consumed by model
-    career_wins:      Optional[int]  = None   # None = not populated; 0 = confirmed zero
-    career_losses:    Optional[int]  = None
-    ytd_wins:         Optional[int]  = None   # None = not fetched; 0 = confirmed zero
-    ytd_losses:       Optional[int]  = None
-    hard_wins:        int            = 0
-    hard_losses:      int            = 0
-    clay_wins:        int            = 0
-    clay_losses:      int            = 0
-    grass_wins:       int            = 0
-    grass_losses:     int            = 0
-    recent_form:      list           = field(default_factory=list)
-    career_high_rank: Optional[int]  = None   # metadata only — not consumed by model
-    data_source:      str            = "unknown"
-    serve_stats:      dict           = field(default_factory=dict)
-
-
-@dataclass
-class MatchPick:
-    player_a:         PlayerProfile
-    player_b:         PlayerProfile
-    surface:          str   = "Hard"
-    tournament:       str   = "ATP Tour"
-    tournament_level: str   = "ATP 250"
-    tour:             str   = "ATP"    # "ATP" or "WTA" — derived from tournament name
-    prob_a:           float = 0.50
-    prob_b:           float = 0.50
-    fair_odds_a:      float = 2.00
-    fair_odds_b:      float = 2.00
-    market_odds_a:    Optional[float] = None
-    market_odds_b:    Optional[float] = None
-    edge_a:           Optional[float] = None
-    edge_b:           Optional[float] = None
-    pick_player:          str   = ""
-    bookmaker:            str   = ""
-    h2h_summary:          str   = "No prior meetings"
-    factor_breakdown:     dict  = field(default_factory=dict)
-    simulation:           dict  = field(default_factory=dict)
-    confidence:           str   = "LOW"
-    validation_passed:    bool  = True
-    filter_reason:        str   = ""
-    validation_warnings:  list  = field(default_factory=list)
-    odds_source:          str   = "manual"   # "live" or "manual"
-    evaluator_result:     dict  = field(default_factory=dict)
-    quality_tier:         str   = ""         # "CLEAN" | "CAUTION" | "FRAGILE" — operational output only
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP HELPERS
@@ -138,50 +97,62 @@ def _get_html(url: str) -> str:
         r = SESSION.get(url, timeout=12)
         r.raise_for_status()
         return r.text
-    except requests.RequestException:
+    except requests.RequestException as exc:
+        log.warning(f"HTTP fetch failed [{url}]: {exc}")
         return ""
+
+
+def _ta_fetch(url: str) -> tuple[str, str | None]:
+    """
+    Tennis Abstract fetch with explicit error classification + retry.
+    Used by _top_up_from_tennis_abstract to distinguish failure modes.
+
+    P1: uses fetch_with_retry() for transparent retries on 429/timeout/502-504
+    (up to 3 attempts, 2s/4s backoff).  Error classification is unchanged.
+
+    Returns:
+        (html, degraded_reason) where degraded_reason is None on success, or one of:
+        "degraded_ratelimit" (HTTP 429 — after all retries exhausted)
+        "degraded_timeout"   (requests.Timeout — after all retries exhausted)
+        "degraded_empty"     (non-200, connection error, or HTML too short)
+    """
+    try:
+        r = fetch_with_retry(SESSION, url)   # P1: retry on transient failures
+        if r.status_code == 429:
+            log.warning(f"[TA] 429 rate-limited (after retries): {url}")
+            return "", "degraded_ratelimit"
+        r.raise_for_status()
+        html = r.text
+        if not html or len(html) < 500:
+            log.warning(f"[TA] Response too short for: {url}")
+            return "", "degraded_empty"
+        return html, None
+    except requests.Timeout:
+        log.warning(f"[TA] Timeout (after retries): {url}")
+        return "", "degraded_timeout"
+    except requests.HTTPError as exc:
+        code = exc.response.status_code if exc.response is not None else 0
+        log.warning(f"[TA] HTTP {code}: {url}")
+        return "", "degraded_empty"
+    except requests.RequestException as exc:
+        log.warning(f"[TA] Fetch failed: {exc}")
+        return "", "degraded_empty"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PLAYER ID RESOLUTION
 # ──────────────────────────────────────────────────────────────────────────────
 
-def resolve_player_id(short_name: str) -> tuple[str, str, str]:
-    """Returns (full_name, slug, atp_id). Checks local map first."""
-    name_lower = short_name.lower().strip()
+def resolve_player_id(short_name: str) -> tuple[str, str, str, str]:
+    """
+    Returns (full_name, slug, atp_id, identity_source).
 
-    # 1. Local map (fastest)
-    for key, val in PLAYER_ID_MAP.items():
-        if key in name_lower:
-            log.info(f"ID resolved from map: {val[0]} ({val[2]})")
-            return val
-
-    # 2. Skip ATP fetch entirely for WTA players — they have no ATP ID.
-    # Return full_name from WTA_PROFILES so name_clean resolves to correct jsfrags URL.
-    _last = name_lower.replace(".", " ").split()[-1]
-    for key, val in WTA_PROFILES.items():
-        if key in name_lower or key.split()[-1] == _last:
-            full_name_wta = val.get("full_name", short_name)
-            return full_name_wta, "", ""
-
-    # 3. ATP search HTML (parse href pattern /players/slug/ID/overview)
-    parts      = short_name.strip().split()
-    query      = parts[-1] if len(parts) > 1 and len(parts[0]) <= 2 else short_name
-    search_url = f"https://www.atptour.com/en/players?query={requests.utils.quote(query)}"
-    html       = _get_html(search_url)
-    m          = re.search(r'/players/([a-z0-9\-]+)/([A-Z0-9]{4})/overview', html)
-    if m:
-        slug = m.group(1)
-        pid  = m.group(2)
-        full = slug.replace("-", " ").title()
-        log.info(f"ID resolved from ATP search: {full} | {pid}")
-        return full, slug, pid
-
-    log.warning(
-        f"Cannot resolve ATP ID for '{short_name}'.\n"
-        f"  → Add to PLAYER_ID_MAP: e.g.  \"{name_lower.split()[-1]}\": "
-        f"(\"Full Name\", \"url-slug\", \"XXXX\")"
-    )
-    return short_name, "", ""
+    P1: thin wrapper — logic now lives in ingestion/identity.py.
+    Kept for any callers outside pipeline.py; internal code uses
+    resolve_identity() directly via fetch_player_profile().
+    """
+    r = resolve_identity(short_name)
+    return r.full_name, r.slug, r.atp_id, r.source
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LIVE ATP API (top-up layer)
@@ -244,544 +215,6 @@ def _top_up_from_api(pid: str, profile: PlayerProfile) -> None:
             profile.recent_form = form[:10]
 
 
-def _parse_ta_serve_stats(html: str) -> dict:
-    """Parse per-match serve stats from Tennis Abstract matchmx JS array.
-
-    matchhead column indices (confirmed from live page):
-      2=surf, 23=pts, 24=firsts(1stIn), 25=fwon(1stWon), 26=swon(2ndWon),
-      32=opts(opp service pts), 34=ofwon(opp 1st won), 35=oswon(opp 2nd won)
-
-    Returns a dict keyed by surface ('career','hard','clay','grass') plus
-    'source'='tennis_abstract', or empty dict on any parse failure.
-    """
-    import json as _json
-    m = re.search(r'var matchmx\s*=\s*(\[.*?\]);', html, re.S)
-    if not m:
-        return {}
-    try:
-        rows = _json.loads(m.group(1))
-    except (ValueError, TypeError):
-        return {}
-
-    # Plausible ranges for aggregated serve stats (raw point totals, not per-match %)
-    _BOUNDS = {
-        "first_serve_in":    (0.30, 0.80),
-        "first_serve_won":   (0.40, 0.85),
-        "second_serve_won":  (0.30, 0.75),
-        "serve_win_pct":     (0.35, 0.85),
-    }
-
-    def _in_bounds(key: str, val: float) -> bool:
-        lo, hi = _BOUNDS.get(key, (0.0, 1.0))
-        return lo <= val <= hi
-
-    def _agg(surface=None):
-        pts = firsts = fwon = swon = opts = ofwon = oswon = n = 0
-        skipped = 0
-        for r in rows:
-            if len(r) <= 35:
-                continue
-            if surface and r[2].lower() != surface:
-                continue
-            try:
-                _pts = int(r[23]) if r[23] else 0
-                if _pts == 0:
-                    continue
-                _firsts = int(r[24] or 0)
-                _fwon   = int(r[25] or 0)
-                _swon   = int(r[26] or 0)
-                _second = _pts - _firsts
-                # Row-level range check before accumulating
-                if _firsts == 0 or _second <= 0:
-                    skipped += 1
-                    continue
-                _fi = _firsts / _pts
-                _fw = _fwon   / _firsts
-                _sw = _swon   / _second
-                if not (_in_bounds("first_serve_in", _fi)
-                        and _in_bounds("first_serve_won", _fw)
-                        and _in_bounds("second_serve_won", _sw)):
-                    log.debug(
-                        f"ATP matchmx: dropping row — out-of-range "
-                        f"fi={_fi:.3f} fw={_fw:.3f} sw={_sw:.3f}"
-                    )
-                    skipped += 1
-                    continue
-                pts    += _pts
-                firsts += _firsts
-                fwon   += _fwon
-                swon   += _swon
-                opts   += int(r[32] or 0)
-                ofwon  += int(r[34] or 0)
-                oswon  += int(r[35] or 0)
-                n      += 1
-            except (ValueError, IndexError, TypeError):
-                continue
-        if skipped:
-            log.debug(f"ATP matchmx: skipped {skipped} out-of-range rows")
-        if pts == 0 or firsts == 0:
-            return None
-        second_pts = pts - firsts
-        fi = round(firsts / pts, 4)
-        fw = round(fwon / firsts, 4)
-        sw = round(swon / second_pts, 4) if second_pts > 0 else 0.50
-        swp = round(fi * fw + (1 - fi) * sw, 4)
-        # Final aggregate bounds check
-        if not (_in_bounds("first_serve_in", fi)
-                and _in_bounds("first_serve_won", fw)
-                and _in_bounds("second_serve_won", sw)
-                and _in_bounds("serve_win_pct", swp)):
-            log.warning(
-                f"ATP matchmx: aggregate out of range after {n} matches — "
-                f"fi={fi} fw={fw} sw={sw} swp={swp} — discarding"
-            )
-            return None
-        return {
-            "first_serve_in":    fi,
-            "first_serve_won":   fw,
-            "second_serve_won":  sw,
-            "serve_win_pct":     swp,
-            "return_points_won": round(1 - (ofwon + oswon) / opts, 4) if opts > 0 else 0.38,
-            "n": n,
-            "sample_type": f"matchmx_{surface or 'career'}",
-        }
-
-    result: dict = {}
-    career = _agg()
-    if career:
-        result["career"] = career
-    for surf in ("hard", "clay", "grass"):
-        s = _agg(surf)
-        if s and s["n"] >= 5:
-            result[surf] = s
-    if not result:
-        return {}
-    result["source"] = "tennis_abstract"
-    return result
-
-
-def _parse_ta_wta_serve_stats(name_clean: str) -> dict:
-    """Fetch and parse WTA serve stats from Tennis Abstract jsfrags JS file.
-
-    URL: https://www.tennisabstract.com/jsfrags/{CamelCaseName}.js
-    Parses the 'recent-results' HTML table (columns 0-15):
-      Date|Tournament|Surface|Rd|Rk|vRk|Match|Score|DR|A%|DF%|1stIn|1st%|2nd%|BPSvd|Time
-                      idx=2                                        11   12   13   14
-
-    Returns a dict keyed by surface ('career','hard','clay','grass') plus
-    'source'='tennis_abstract_wta', or empty dict on failure.
-    """
-    try:
-        from bs4 import BeautifulSoup as _BS
-    except ImportError:
-        log.warning("bs4 not installed — cannot parse WTA jsfrags serve stats")
-        return {}
-
-    url = f"https://www.tennisabstract.com/jsfrags/{name_clean}.js"
-    js_text = _get_html(url)
-    if not js_text or len(js_text) < 200:
-        return {}
-
-    # The file is: var player_frag = `<html>...`;
-    m = re.search(r'var player_frag\s*=\s*`(.*?)`;', js_text, re.DOTALL)
-    table_html = m.group(1) if m else js_text
-
-    soup = _BS(table_html, 'html.parser')
-    table = soup.find('table', id='recent-results')
-    if not table:
-        return {}
-
-    def _pct_to_float(s: str):
-        s = s.strip().rstrip('%')
-        try:
-            return float(s) / 100.0
-        except (ValueError, TypeError):
-            return None
-
-    def _bp_fraction(s: str):
-        bm = re.match(r'(\d+)/(\d+)', s.strip())
-        return (int(bm.group(1)), int(bm.group(2))) if bm else None
-
-    _BOUNDS_WTA = {
-        "first_serve_in":    (0.30, 0.80),
-        "first_serve_won":   (0.40, 0.85),
-        "second_serve_won":  (0.30, 0.75),
-        "serve_win_pct":     (0.35, 0.85),
-    }
-
-    def _in_bounds_wta(key: str, val: float) -> bool:
-        lo, hi = _BOUNDS_WTA.get(key, (0.0, 1.0))
-        return lo <= val <= hi
-
-    surface_data: dict[str, dict] = {}
-    valid_surfaces = {"hard", "clay", "grass"}
-    _skipped_rows = 0
-
-    for row in table.find_all('tr'):
-        cells = [c.get_text(strip=True) for c in row.find_all('td')]
-        if len(cells) < 15:
-            continue
-        surf_key = cells[2].strip().lower()
-        if surf_key not in valid_surfaces:
-            continue
-
-        fi = _pct_to_float(cells[11])  # 1stIn
-        fw = _pct_to_float(cells[12])  # 1st%
-        sw = _pct_to_float(cells[13])  # 2nd%
-        if fi is None or fw is None or sw is None:
-            continue  # upcoming match or missing data
-
-        # Row-level bounds check
-        if (not _in_bounds_wta("first_serve_in", fi)
-                or not _in_bounds_wta("first_serve_won", fw)
-                or not _in_bounds_wta("second_serve_won", sw)):
-            log.debug(
-                f"WTA serve stats ({name_clean}) row skipped — out of bounds: "
-                f"fi={fi:.3f} fw={fw:.3f} sw={sw:.3f}"
-            )
-            _skipped_rows += 1
-            continue
-
-        bp = _bp_fraction(cells[14]) if len(cells) > 14 else None
-
-        for key in (surf_key, "career"):
-            if key not in surface_data:
-                surface_data[key] = {"fi": [], "fw": [], "sw": [], "bp_s": 0, "bp_t": 0, "n": 0}
-            d = surface_data[key]
-            d["fi"].append(fi)
-            d["fw"].append(fw)
-            d["sw"].append(sw)
-            d["n"] += 1
-            if bp:
-                d["bp_s"] += bp[0]
-                d["bp_t"] += bp[1]
-
-    result: dict = {}
-    for key, d in surface_data.items():
-        n = d["n"]
-        if n == 0:
-            continue
-        if key != "career" and n < 3:
-            continue  # too few surface matches
-        # KNOWN LIMITATION: jsfrags provides per-match % totals, not raw point counts.
-        # We average the per-match percentages equally regardless of match length.
-        # A 100-point match and a 20-point match each contribute 1/n weight.
-        # The ATP path (matchmx) avoids this by aggregating raw point totals first.
-        if n < 10:
-            log.warning(
-                f"WTA serve stats for {name_clean} ({key}): only {n} matches — "
-                f"average-of-averages bias likely; treat stats as approximate"
-            )
-        else:
-            log.info(
-                f"WTA serve stats for {name_clean} ({key}): {n} matches averaged "
-                f"(average-of-averages — unequal match lengths not corrected)"
-            )
-        avg_fi  = sum(d["fi"]) / n
-        avg_fw  = sum(d["fw"]) / n
-        avg_sw  = sum(d["sw"]) / n
-        avg_swp = round(avg_fi * avg_fw + (1 - avg_fi) * avg_sw, 4)
-        # Aggregate bounds check
-        if (not _in_bounds_wta("first_serve_in", avg_fi)
-                or not _in_bounds_wta("first_serve_won", avg_fw)
-                or not _in_bounds_wta("second_serve_won", avg_sw)
-                or not _in_bounds_wta("serve_win_pct", avg_swp)):
-            log.warning(
-                f"WTA serve stats ({name_clean}, {key}): aggregate out of bounds "
-                f"fi={avg_fi:.3f} fw={avg_fw:.3f} sw={avg_sw:.3f} swp={avg_swp:.3f} — discarding"
-            )
-            continue
-        entry = {
-            "first_serve_in":   round(avg_fi, 4),
-            "first_serve_won":  round(avg_fw, 4),
-            "second_serve_won": round(avg_sw, 4),
-            "serve_win_pct":    avg_swp,
-            "n": n,
-            "sample_type": f"jsfrags_{key}",
-        }
-        if d["bp_t"] > 0:
-            entry["break_saved_pct"] = round(d["bp_s"] / d["bp_t"], 4)
-        result[key] = entry
-
-    if _skipped_rows:
-        log.debug(f"WTA serve stats ({name_clean}): skipped {_skipped_rows} out-of-bounds rows total")
-    if not result:
-        return {}
-
-    result["source"] = "tennis_abstract_wta"
-    log.info(f"WTA serve stats from jsfrags ({name_clean}): "
-             f"{result.get('career', {}).get('n', 0)} career matches, "
-             f"surfaces={sorted(k for k in result if k not in ('source', 'career'))}")
-    return result
-
-
-def _parse_ta_wta_full_profile(name_clean: str) -> Optional[dict]:
-    """
-    Fetch WTA jsfrags ONCE and extract complete player data from the correct tables:
-
-      #year-end-rankings → current ranking (first 'Current...' row, col 1)
-      #career-splits     → all-time hard/clay/grass W/L (accurate career records)
-      #tour-years        → current-year YTD W/L (all matches, not just recent-results subset)
-      #recent-results    → recent form (last 10 W/L) + per-match serve stats
-
-    Using these dedicated tables avoids the two key bugs in the previous implementation:
-    (1) surface splits counted from only the last ~20 rows instead of career totals;
-    (2) ranking required a separate wplayer.cgi HTTP request, often rate-limited.
-
-    Returns a dict of PlayerProfile fields + 'serve_stats', or None on failure.
-    """
-    try:
-        from bs4 import BeautifulSoup as _BS
-    except ImportError:
-        log.warning("bs4 not installed — cannot parse WTA jsfrags full profile")
-        return None
-
-    url = f"https://www.tennisabstract.com/jsfrags/{name_clean}.js"
-    js_text = _get_html(url)
-    if not js_text or len(js_text) < 200:
-        log.debug(f"jsfrags fetch failed for {name_clean}")
-        return None
-
-    m = re.search(r'var player_frag\s*=\s*`(.*?)`;', js_text, re.DOTALL)
-    table_html = m.group(1) if m else js_text
-    soup = _BS(table_html, 'html.parser')
-
-    def _cells(row):
-        return [c.get_text(strip=True) for c in row.find_all(['td', 'th'])]
-
-    # ── 1. Ranking from #year-end-rankings ────────────────────────────────────
-    # First data row is 'Current (YYYY-MM-DD)' with WTA rank in column 1.
-    ranking = 9999
-    yer = soup.find('table', id='year-end-rankings')
-    if yer:
-        for row in yer.find_all('tr'):
-            c = _cells(row)
-            if c and c[0].startswith('Current') and len(c) >= 2:
-                try:
-                    ranking = int(c[1])
-                except (ValueError, TypeError):
-                    pass
-                break
-
-    # ── 2. Career surface splits from #career-splits ──────────────────────────
-    # Rows: Split | M | W | L | Win% | ...
-    # Split values: 'Hard', 'Clay', 'Grass' (also Indoor/Outdoor but we skip those)
-    hard_wins = hard_losses = 0
-    clay_wins = clay_losses = 0
-    grass_wins = grass_losses = 0
-    cs = soup.find('table', id='career-splits')
-    if cs:
-        for row in cs.find_all('tr'):
-            c = _cells(row)
-            if len(c) < 4:
-                continue
-            surf = c[0].lower().strip()
-            try:
-                w, l = int(c[2]), int(c[3])
-            except (ValueError, TypeError):
-                continue
-            if surf == 'hard':
-                hard_wins, hard_losses = w, l
-            elif surf == 'clay':
-                clay_wins, clay_losses = w, l
-            elif surf == 'grass':
-                grass_wins, grass_losses = w, l
-
-    career_wins  = hard_wins  + clay_wins  + grass_wins
-    career_losses= hard_losses + clay_losses + grass_losses
-
-    # ── 3. YTD from #tour-years ───────────────────────────────────────────────
-    # Rows: Year | M | W | L | Win% | ...
-    current_year = str(date.today().year)
-    ytd_wins = ytd_losses = 0
-    ty = soup.find('table', id='tour-years')
-    if ty:
-        for row in ty.find_all('tr'):
-            c = _cells(row)
-            if c and c[0] == current_year and len(c) >= 4:
-                try:
-                    ytd_wins   = int(c[2])
-                    ytd_losses = int(c[3])
-                except (ValueError, TypeError):
-                    pass
-                break
-
-    # ── 4. Recent form + serve stats from #recent-results ────────────────────
-    # W/L detection: cells[6] text is "Winnerd. Loser" (win, no space before d.)
-    # or "Opponent d. Winner" (loss, space before d.). Split on 'd. ' (space after).
-    rr = soup.find('table', id='recent-results')
-    if not rr:
-        log.debug(f"No #recent-results table in jsfrags for {name_clean}")
-        return None
-
-    # Derive last-name fragment for W/L detection
-    name_parts = re.findall(r'[A-Z][a-z]+', name_clean)
-    search_names: list[str] = []
-    if name_parts:
-        search_names.append(name_parts[-1])
-        if len(name_parts) >= 2:
-            search_names.append(name_parts[-2])
-    if name_clean[:6] not in search_names:
-        search_names.append(name_clean[:6])
-
-    valid_surfaces = {"hard", "clay", "grass"}
-
-    def _pf(s: str):
-        try:
-            return float(s.strip().rstrip('%')) / 100.0
-        except (ValueError, TypeError):
-            return None
-
-    def _bp(s: str):
-        bm = re.match(r'(\d+)/(\d+)', s.strip())
-        return (int(bm.group(1)), int(bm.group(2))) if bm else None
-
-    _SS_BOUNDS = {
-        "first_serve_in":    (0.30, 0.80),
-        "first_serve_won":   (0.40, 0.85),
-        "second_serve_won":  (0.30, 0.75),
-        "serve_win_pct":     (0.35, 0.85),
-    }
-
-    def _ss_in_bounds(key: str, val: float) -> bool:
-        lo, hi = _SS_BOUNDS.get(key, (0.0, 1.0))
-        return lo <= val <= hi
-
-    form_results: list[str] = []   # most-recent-first (table order)
-    surf_serve:   dict      = {}
-    _ss_skipped  = 0
-
-    for row in rr.find_all('tr'):
-        cells = [c.get_text(strip=True) for c in row.find_all('td')]
-        if len(cells) < 7:
-            continue
-
-        surf_key   = cells[2].strip().lower()
-        match_text = cells[6].strip()
-
-        if surf_key not in valid_surfaces:
-            continue
-        if not match_text or 'd. ' not in match_text:
-            continue   # upcoming match or bye
-
-        parts_d = re.split(r'd\. ', match_text, 1)
-        if len(parts_d) != 2:
-            continue
-        winner_part, loser_part = parts_d[0], parts_d[1]
-
-        result: Optional[str] = None
-        for sn in search_names:
-            snl = sn.lower()
-            if snl in winner_part.lower():
-                result = 'W'
-                break
-            elif snl in loser_part.lower():
-                result = 'L'
-                break
-        if result is None:
-            continue
-
-        form_results.append(result)
-
-        # Serve stats (per-match averages — average-of-averages limitation noted)
-        if len(cells) >= 14:
-            fi = _pf(cells[11])
-            fw = _pf(cells[12])
-            sw = _pf(cells[13])
-            if fi is not None and fw is not None and sw is not None:
-                # Row-level bounds check
-                if (not _ss_in_bounds("first_serve_in", fi)
-                        or not _ss_in_bounds("first_serve_won", fw)
-                        or not _ss_in_bounds("second_serve_won", sw)):
-                    log.debug(
-                        f"jsfrags ({name_clean}) serve row skipped — out of bounds: "
-                        f"fi={fi:.3f} fw={fw:.3f} sw={sw:.3f}"
-                    )
-                    _ss_skipped += 1
-                else:
-                    bp_val = _bp(cells[14]) if len(cells) > 14 else None
-                    for key in (surf_key, "career"):
-                        if key not in surf_serve:
-                            surf_serve[key] = {"fi": [], "fw": [], "sw": [],
-                                               "bp_s": 0, "bp_t": 0, "n": 0}
-                        d = surf_serve[key]
-                        d["fi"].append(fi); d["fw"].append(fw); d["sw"].append(sw)
-                        d["n"] += 1
-                        if bp_val:
-                            d["bp_s"] += bp_val[0]; d["bp_t"] += bp_val[1]
-
-    if not form_results and career_wins + career_losses == 0 and ytd_wins + ytd_losses == 0:
-        log.debug(f"No usable data in jsfrags for {name_clean}")
-        return None
-
-    # recent_form: oldest-first convention (model uses [-10:], [-1] = most recent)
-    recent_form = list(reversed(form_results[:10]))
-
-    if _ss_skipped:
-        log.debug(f"jsfrags ({name_clean}): skipped {_ss_skipped} out-of-bounds serve rows")
-
-    # Build serve stats dict
-    serve_stats: dict = {}
-    for key, d in surf_serve.items():
-        n = d["n"]
-        if n == 0 or (key != "career" and n < 3):
-            continue
-        avg_fi  = sum(d["fi"]) / n
-        avg_fw  = sum(d["fw"]) / n
-        avg_sw  = sum(d["sw"]) / n
-        avg_swp = round(avg_fi * avg_fw + (1 - avg_fi) * avg_sw, 4)
-        # Aggregate bounds check
-        if (not _ss_in_bounds("first_serve_in", avg_fi)
-                or not _ss_in_bounds("first_serve_won", avg_fw)
-                or not _ss_in_bounds("second_serve_won", avg_sw)
-                or not _ss_in_bounds("serve_win_pct", avg_swp)):
-            log.warning(
-                f"jsfrags ({name_clean}, {key}): aggregate serve stats out of bounds "
-                f"fi={avg_fi:.3f} fw={avg_fw:.3f} sw={avg_sw:.3f} swp={avg_swp:.3f} — discarding"
-            )
-            continue
-        entry = {
-            "first_serve_in":   round(avg_fi, 4),
-            "first_serve_won":  round(avg_fw, 4),
-            "second_serve_won": round(avg_sw, 4),
-            "serve_win_pct":    avg_swp,
-            "n": n,
-            "sample_type": f"jsfrags_{key}",
-        }
-        if d["bp_t"] > 0:
-            entry["break_saved_pct"] = round(d["bp_s"] / d["bp_t"], 4)
-        serve_stats[key] = entry
-    if serve_stats:
-        serve_stats["source"] = "tennis_abstract_wta"
-
-    log.info(
-        f"jsfrags full profile ({name_clean}): "
-        f"Rank #{ranking} | YTD {ytd_wins}-{ytd_losses} | "
-        f"Hard {hard_wins}-{hard_losses} | Clay {clay_wins}-{clay_losses} | "
-        f"Grass {grass_wins}-{grass_losses} | "
-        f"career {career_wins}-{career_losses} | "
-        f"Form={''.join(recent_form[-5:])} | "
-        f"Serve n={serve_stats.get('career', {}).get('n', 0)}"
-    )
-    result: dict = {
-        "ytd_wins":     ytd_wins,
-        "ytd_losses":   ytd_losses,
-        "hard_wins":    hard_wins,
-        "hard_losses":  hard_losses,
-        "clay_wins":    clay_wins,
-        "clay_losses":  clay_losses,
-        "grass_wins":   grass_wins,
-        "grass_losses": grass_losses,
-        "career_wins":  career_wins,
-        "career_losses":career_losses,
-        "recent_form":  recent_form,
-        "serve_stats":  serve_stats,
-        "data_source":  "tennis_abstract_dynamic",
-    }
-    if ranking != 9999:
-        result["ranking"] = ranking
-    return result
-
 
 def _top_up_from_tennis_abstract(profile: PlayerProfile) -> None:
     """Tennis Abstract fallback. Fetches ranking for all players; serve stats for WTA via jsfrags."""
@@ -806,8 +239,31 @@ def _top_up_from_tennis_abstract(profile: PlayerProfile) -> None:
 
     # ATP path: fetch from player-classic page
     url = f"https://www.tennisabstract.com/cgi-bin/player-classic.cgi?p={name_clean}"
-    html = _get_html(url)
-    if not html or len(html) < 500:
+    html, _fetch_err = _ta_fetch(url)  # P0: classify errors; P1: retry inside
+    if _fetch_err:
+        # P1: try local cache before falling through to P0 degraded state
+        if profile.identity_source != "unresolved":
+            _key    = _profile_cache_key(profile.tour or "atp", profile.full_name or profile.short_name)
+            _cached = _load_cached_profile(_key)
+            if _cached:
+                _apply_cached_to_profile(profile, _cached)
+                profile.profile_quality = "degraded"
+                log.warning(
+                    f"[CACHE HIT] {profile.short_name}: loaded cached TA profile "
+                    f"({_fetch_err}) — data may be up to 24h old"
+                )
+                return
+
+        # No cache (or unresolved identity) → P0 behavior: degraded, no hard fail
+        log.warning(
+            f"Tennis Abstract: ATP page failed for {profile.short_name} "
+            f"[{_fetch_err}] — skipping TA top-up"
+        )
+        # P0: if identity was resolved, set a degraded state instead of leaving
+        # data_source="unknown" which would trigger a hard fail in validation.
+        if profile.identity_source != "unresolved":
+            profile.data_source    = _fetch_err   # "degraded_ratelimit" / "degraded_timeout" / "degraded_empty"
+            profile.profile_quality = "degraded"
         return
 
     if profile.ranking == 9999:
@@ -859,9 +315,15 @@ def _top_up_from_tennis_abstract(profile: PlayerProfile) -> None:
                 f"{profile.short_name}: serve stats from Tennis Abstract "
                 f"({ss.get('career', {}).get('n', 0)} career matches with data)"
             )
+        else:
+            log.warning(f"{profile.short_name}: ATP serve stats unavailable from Tennis Abstract — using model defaults")
 
     if profile.ranking < 9999 or profile.hard_wins > 0:
-        profile.data_source = "tennis_abstract"
+        profile.data_source    = "tennis_abstract"
+        profile.profile_quality = "full"   # P0: successful TA fetch = full quality
+        # P1: persist to cache so a future 429/timeout can serve stale data
+        _key = _profile_cache_key(profile.tour or "atp", profile.full_name or profile.short_name)
+        _save_cached_profile(_key, _profile_to_cacheable(profile))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # INACTIVITY HELPER
@@ -936,10 +398,13 @@ def fetch_player_profile(short_name: str, tour: str = "") -> PlayerProfile:
                   NEVER falls through to ATP endpoints when tour='wta'
     """
     profile           = PlayerProfile(short_name=short_name)
-    full, slug, pid   = resolve_player_id(short_name)
-    profile.full_name = full or short_name
-    profile.slug      = slug
-    profile.atp_id    = pid
+    # P1: delegate to ingestion/identity.py
+    _id = resolve_identity(short_name)
+    profile.full_name       = _id.full_name or short_name
+    profile.slug            = _id.slug
+    profile.atp_id          = _id.atp_id
+    profile.identity_source = _id.source   # P0: record how identity was resolved
+    pid = _id.atp_id  # P2 fix: was undefined after P1 refactor (caused NameError on static curated path)
 
     is_wta = tour.lower() == "wta"
 
@@ -948,7 +413,8 @@ def fetch_player_profile(short_name: str, tour: str = "") -> PlayerProfile:
     if not is_wta and pid and pid.upper() in STATIC_PROFILES:
         for k, v in STATIC_PROFILES[pid.upper()].items():
             setattr(profile, k, v)
-        profile.data_source = "static_curated"
+        profile.data_source    = "static_curated"
+        profile.profile_quality = "full"   # P0: curated static = full quality
         static_applied = True
         log.info(f"Static data applied for {profile.full_name}")
 
@@ -981,9 +447,11 @@ def fetch_player_profile(short_name: str, tour: str = "") -> PlayerProfile:
                     profile.serve_stats = v
                 else:
                     setattr(profile, k, v)  # sets data_source="tennis_abstract_dynamic"
+            profile.profile_quality = "full"  # P0: live jsfrags = full quality
             log.info(f"Dynamic WTA profile built from jsfrags for {profile.full_name}")
         elif static_applied:
             # jsfrags failed; fall back to stale WTA_PROFILES data + serve stats top-up
+            profile.profile_quality = "degraded"  # P0: stale static = degraded
             log.warning(
                 f"WTA static profile for {profile.full_name} — "
                 f"data may be stale (manually maintained); jsfrags failed"
@@ -1003,13 +471,19 @@ def fetch_player_profile(short_name: str, tour: str = "") -> PlayerProfile:
         else:
             # Unknown WTA player: build estimated profile, NEVER touch ATP endpoints
             _build_wta_estimated_profile(profile, name_clean)
+            # P0: wta_estimated has identity resolved (via wta_profiles fallback or
+            # estimated) but stats are defaults — treat as degraded, not unknown
+            if profile.profile_quality == "unknown":
+                profile.profile_quality = "degraded"
 
+        if not profile.serve_stats:
+            log.warning(f"{profile.full_name}: serve_stats unavailable — using model defaults")
         log.info(
             f"✓ {profile.full_name}: Rank #{profile.ranking} | "
             f"YTD {profile.ytd_wins}-{profile.ytd_losses} | "
             f"Hard {profile.hard_wins}-{profile.hard_losses} "
             f"({_pct(profile.hard_wins, profile.hard_losses)}%) | "
-            f"Source: {profile.data_source}"
+            f"Source: {profile.data_source} | Quality: {profile.profile_quality}"
         )
         return profile
 
@@ -1027,13 +501,31 @@ def fetch_player_profile(short_name: str, tour: str = "") -> PlayerProfile:
     if needs_ta:
         _top_up_from_tennis_abstract(profile)
 
+    # P0: final quality guard for ATP path.
+    # After all top-up layers, if quality is still "unknown" it means every fetch
+    # layer was skipped or failed.  Set quality based on identity resolution so
+    # validation.py uses the correct criterion.
+    if profile.profile_quality == "unknown":
+        if profile.identity_source == "unresolved":
+            pass  # stays "unknown" → hard fail in validation
+        elif profile.data_source in ("static_curated", "tennis_abstract", "atp_api"):
+            profile.profile_quality = "full"
+        else:
+            # identity resolved but stats unavailable — degrade, don't hard fail
+            profile.profile_quality = "degraded"
+            if profile.data_source == "unknown":
+                profile.data_source = "degraded_empty"
+
+    if not profile.serve_stats:
+        log.warning(f"{profile.full_name}: serve_stats unavailable — using model defaults")
     log.info(
         f"✓ {profile.full_name}: Rank #{profile.ranking} | "
         f"YTD {profile.ytd_wins}-{profile.ytd_losses} | "
         f"Hard {profile.hard_wins}-{profile.hard_losses} "
         f"({_pct(profile.hard_wins, profile.hard_losses)}%) | "
         f"Form {''.join(profile.recent_form[:10]) or 'N/A'} | "
-        f"Source: {profile.data_source}"
+        f"Source: {profile.data_source} | Identity: {profile.identity_source} | "
+        f"Quality: {profile.profile_quality}"
     )
     return profile
 
@@ -1151,6 +643,50 @@ def _is_in_player_map(name: str) -> bool:
 # PIPELINE
 # ──────────────────────────────────────────────────────────────────────────────
 
+def run_match_with_result(
+    match_str:      str,
+    tournament:     str            = "ATP Tour",
+    tournament_lvl: str            = "ATP 250",
+    surface:        str            = "Hard",
+    market_odds_a:  Optional[float]= None,
+    market_odds_b:  Optional[float]= None,
+    bookmaker:      str            = "",
+    pick_number:    int            = 1,
+    tour:           str            = "",
+    odds_timestamp: str            = "",
+    _silent:        bool           = False,
+    _prefetched:    bool           = False,
+    _audit=None,           # Optional[DailyAudit]
+):
+    """
+    P6: Backward-compat wrapper — logic lives in orchestration/match_runner.
+
+    The canonical implementation is orchestration.match_runner.run_match_with_result().
+    This wrapper preserves the public API for callers that import from pipeline.
+
+    Helpers fetch_h2h() and _days_inactive() remain here and are imported lazily
+    by the orchestration layer (documented P6 constraint — future extraction possible).
+    """
+    from tennis_model.orchestration.match_runner import (
+        run_match_with_result as _rmwr,
+    )
+    return _rmwr(
+        match_str=match_str,
+        tournament=tournament,
+        tournament_lvl=tournament_lvl,
+        surface=surface,
+        market_odds_a=market_odds_a,
+        market_odds_b=market_odds_b,
+        bookmaker=bookmaker,
+        pick_number=pick_number,
+        tour=tour,
+        odds_timestamp=odds_timestamp,
+        _silent=_silent,
+        _prefetched=_prefetched,
+        _audit=_audit,
+    )
+
+
 def run_match(
     match_str:      str,
     tournament:     str            = "ATP Tour",
@@ -1163,188 +699,20 @@ def run_match(
     tour:           str            = "",
     odds_timestamp: str            = "",
     _silent:        bool           = False,
+    _prefetched:    bool           = False,
+    _audit=None,
 ) -> MatchPick:
-    sep   = re.compile(r"\s+vs\.?\s+", re.I)
-    parts = sep.split(match_str.strip())
-    if len(parts) != 2:
-        raise ValueError(f"Cannot parse '{match_str}' — use 'A. Player vs B. Player'")
+    """
+    Backward-compat wrapper — returns just the MatchPick.
 
-    na, nb = parts[0].strip(), parts[1].strip()
-    log.info(f"\n{'═'*60}\nMATCH: {na} vs {nb}  [{tournament} · {surface}]\n{'═'*60}")
-
-    # Derive tour for odds API: use explicit arg, else infer from tournament string
-    _tour = (tour or ("wta" if "wta" in tournament.lower() or "wta" in tournament_lvl.lower()
-                      else "atp")).lower()
-
-    # --- Live odds (Step B) ---
-    odds_source = "manual"
-    live = get_live_odds(na, nb, tour=_tour)
-    if live:
-        market_odds_a = live["odds_a"]
-        market_odds_b = live["odds_b"]
-        bookmaker     = live["bookmaker"]
-        odds_timestamp = live["timestamp"]
-        odds_source   = "live"
-        log.info(f"Live odds from {bookmaker}: {market_odds_a}/{market_odds_b}")
-    elif market_odds_a or market_odds_b:
-        log.warning("Using manual odds — may be stale")
-
-    pa = fetch_player_profile(na, tour=_tour)
-    pb = fetch_player_profile(nb, tour=_tour)
-
-    match_name = f"{na} vs {nb}"
-
-    # --- Validation ---
-    validation = validate_match(
-        pa, pb, surface,
-        market_odds_a=market_odds_a,
-        market_odds_b=market_odds_b,
-        odds_source=odds_source,
-        odds_timestamp=odds_timestamp,
-    )
-    if not validation.passed:
-        log.warning(f"VALIDATION FAILED {match_name}: {validation.errors}")
-
-    h2h_a, h2h_b, h2h_s = fetch_h2h(pa, pb)
-    prob_a, prob_b, comps = calculate_probability(
-        pa, pb, surface, h2h_a, h2h_b, market_odds_a, market_odds_b
-    )
-
-    fo_a, fo_b = fair_odds(prob_a), fair_odds(prob_b)
-    ea = edge_pct(market_odds_a, fo_a) if market_odds_a else None
-    eb = edge_pct(market_odds_b, fo_b) if market_odds_b else None
-
-    # Sanity guards — catch upstream corruption early
-    assert 0.0 < prob_a < 1.0 and 0.0 < prob_b < 1.0, \
-        f"Probability out of range: prob_a={prob_a}, prob_b={prob_b}"
-    assert abs((prob_a + prob_b) - 1.0) < 0.01, \
-        f"Probabilities do not sum to 1.0: {prob_a + prob_b}"
-    assert fo_a >= 1.0 and fo_b >= 1.0, \
-        f"Fair odds below 1.0: fo_a={fo_a}, fo_b={fo_b}"
-
-    # --- EV filter ---
-    days_inactive_a = _days_inactive(pa)
-    days_inactive_b = _days_inactive(pb)
-    days_inactive = max(days_inactive_a, days_inactive_b)
-
-    # --- Confidence ---
-    max_edge_dec = max(ea or 0.0, eb or 0.0) / 100.0   # % → decimal
-    confidence = compute_confidence(
-        pa, pb, surface, validation,
-        edge=max_edge_dec,
-        model_prob=max(prob_a, prob_b),
-        days_inactive=days_inactive,
-    )
-    if days_inactive > 0:
-        log.info(f"Days inactive (max of both players): {days_inactive}")
-
-    # --- Data gate ---
-    # ATP: block if both players are fully unknown/estimated.
-    # WTA: stricter — both players must have tennis_abstract_dynamic profiles.
-    #      Any stale, static, or estimated source produces fake edges; block early.
-    _gate_reason = None
-    if pa.data_source == "wta_estimated" and pb.data_source == "wta_estimated":
-        _gate_reason = "INSUFFICIENT DATA: both players unrecognised"
-    elif _tour == "wta":
-        _bad = [f"{p.short_name}={p.data_source}" for p in [pa, pb]
-                if p.data_source != "tennis_abstract_dynamic"]
-        if _bad:
-            _gate_reason = f"WTA DATA GATE: {', '.join(_bad)}"
-
-    if _gate_reason:
-        log.warning(f"PICK BLOCKED — {_gate_reason}")
-        _block = EVResult(edge=0.0, is_value=False, filter_reason=_gate_reason)
-        ev_a = ev_b = best_ev = _block
-    else:
-        ev_a = (compute_ev(market_odds_a, fo_a, validation, confidence, days_inactive, tour=_tour)
-                if market_odds_a else EVResult(edge=0.0, is_value=False,
-                                               filter_reason="NO MARKET ODDS"))
-        ev_b = (compute_ev(market_odds_b, fo_b, validation, confidence, days_inactive, tour=_tour)
-                if market_odds_b else EVResult(edge=0.0, is_value=False,
-                                               filter_reason="NO MARKET ODDS"))
-        best_ev = ev_a if ev_a.edge > ev_b.edge else ev_b
-
-    pick_player = ""
-    if ea is not None and eb is not None:
-        if ea >= eb and ea > 0:  pick_player = na
-        elif eb > 0:             pick_player = nb
-
-    pick_tour = "WTA" if _tour == "wta" else "ATP"
-
-    pick = MatchPick(
-        player_a=pa, player_b=pb, surface=surface,
-        tournament=tournament, tournament_level=tournament_lvl,
-        tour=pick_tour,
-        prob_a=prob_a, prob_b=prob_b,
-        fair_odds_a=fo_a, fair_odds_b=fo_b,
-        market_odds_a=market_odds_a, market_odds_b=market_odds_b,
-        edge_a=ea, edge_b=eb,
-        pick_player=pick_player, bookmaker=bookmaker,
-        h2h_summary=h2h_s, factor_breakdown=comps,
-        simulation=comps.get("monte_carlo", {}),
-        confidence=confidence,
-        validation_passed=validation.passed,
-        filter_reason=best_ev.filter_reason or "",
-        validation_warnings=validation.warnings,
-        odds_source=odds_source,
-    )
-
-    # --- Evaluator second pass ---
-    eval_result: dict = {}
-    if EVALUATOR_AVAILABLE:
-        _match_ctx = {
-            "is_live":          False,
-            "days_inactive_a":  days_inactive_a,
-            "days_inactive_b":  days_inactive_b,
-        }
-        try:
-            eval_result = _evaluator_evaluate(pick, _match_ctx)
-            pick.evaluator_result = eval_result
-            log.info(
-                f"Evaluator: {eval_result['alert_level'].upper()} — "
-                f"{eval_result['recommended_action'].upper()} — "
-                f"{eval_result.get('short_message', '')}"
-            )
-            for flag in eval_result.get("risk_flags", []):
-                log.warning(f"RISK FLAG: {flag}")
-            if eval_result.get("recommended_action") == "watchlist":
-                log.info(
-                    f"WATCHLIST: {na} vs {nb} — "
-                    f"{eval_result.get('reasons', [])}"
-                )
-        except Exception as exc:
-            log.warning(f"Evaluator error — skipping second-pass filter: {exc}")
-            eval_result = {}
-
-    # Operational quality tier — output-only, no model logic
-    pick.quality_tier = _quality_tier(pick)
-
-    card     = format_pick_card(pick, pick_number)
-    table    = format_factor_table(pick)
-    analysis = format_value_analysis(pick)
-    if not _silent:
-        print("\n" + card + table + analysis + "\n")
-
-    if best_ev.is_value:
-        evaluator_approved = (
-            not EVALUATOR_AVAILABLE
-            or eval_result.get("recommended_action") in ("send", "send_with_caution")
-        )
-        if evaluator_approved:
-            maybe_alert(pick, card + "\n" + analysis)
-        else:
-            # Update filter_reason so run_batch.py display is accurate
-            pick.filter_reason = (
-                f"EVALUATOR_{eval_result.get('recommended_action', 'blocked').upper()}"
-            )
-            log.warning(
-                f"EV passed but evaluator blocked: "
-                f"{eval_result.get('recommended_action')} — "
-                f"{eval_result.get('short_message', '')}"
-            )
-    else:
-        log.info(f"FILTERED {match_name}: {best_ev.filter_reason}")
-    return pick
+    Callers that need the full MatchRunResult (EvaluatorDecision, AlertDecision,
+    MatchFinalStatus) should call run_match_with_result() directly.
+    """
+    return run_match_with_result(
+        match_str, tournament, tournament_lvl, surface,
+        market_odds_a, market_odds_b, bookmaker, pick_number,
+        tour, odds_timestamp, _silent, _prefetched, _audit,
+    ).pick
 
 
 def run_from_config(cfg_path: str = "config.json") -> None:
@@ -1394,7 +762,13 @@ def scan_today(cfg_path: str = "config.json") -> None:
       QUALIFIED ONLY     — edge passed EV filters but evaluator blocked
       BLOCKED            — data gate / suspicious edge / low confidence / etc.
       SKIPPED            — network error, parse failure, or no odds returned
+
+    P1: emits a DailyAudit log at the end of each run.
     """
+    # P1: initialise daily audit (logged at end of run)
+    from tennis_model.orchestration.audit import DailyAudit
+    audit = DailyAudit()
+
     # --- Load Telegram config (same as run_from_config) ---
     if os.path.exists(cfg_path):
         with open(cfg_path) as _f:
@@ -1403,6 +777,9 @@ def scan_today(cfg_path: str = "config.json") -> None:
         if tg.get("bot_token"):      _tg.TELEGRAM_BOT_TOKEN    = tg["bot_token"]
         if tg.get("chat_id"):        _tg.TELEGRAM_CHAT_ID      = tg["chat_id"]
         if tg.get("edge_threshold"): _fmt.EDGE_ALERT_THRESHOLD = float(tg["edge_threshold"])
+
+    # P0: log Telegram status once at startup — avoids silent dry_run surprises
+    audit.telegram_configured = _tg.check_telegram_config()  # P1: record in audit
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
     print(f"\n{'═'*64}")
@@ -1415,9 +792,16 @@ def scan_today(cfg_path: str = "config.json") -> None:
 
     print(f"  Slate fetched: {total_atp} ATP events, {total_wta} WTA events\n")
 
-    alerts:  list[dict] = []   # EV passed (sent or qualified-only)
-    blocked: list[dict] = []   # blocked by a guard rail
-    skipped: list[dict] = []   # exception / no odds
+    alerts:         list[dict] = []   # EV passed (sent or qualified-only)
+    blocked:        list[dict] = []   # blocked by a guard rail
+    skipped:        list[dict] = []   # exception / no odds
+    resolved_picks: list       = []   # MatchPick objects (for DailyAudit)
+
+    # P5: MatchFinalStatus sets used for classification (replaces string inspection)
+    from tennis_model.orchestration.match_runner import (
+        ALERT_SENT_STATUSES as _ALERT_SENT_STATUSES,
+        EVALUATOR_BLOCKED_STATUSES as _EVALUATOR_BLOCKED_STATUSES,
+    )
 
     atp_both = atp_one = atp_none = 0
     pick_number = 0
@@ -1444,7 +828,8 @@ def scan_today(cfg_path: str = "config.json") -> None:
 
             pick_number += 1
             try:
-                pick = run_match(
+                # P5: use run_match_with_result() to get MatchRunResult
+                _run_result = run_match_with_result(
                     match_str, tournament, level, surface,
                     market_odds_a=event["odds_a"],
                     market_odds_b=event["odds_b"],
@@ -1453,7 +838,10 @@ def scan_today(cfg_path: str = "config.json") -> None:
                     tour=tour,
                     odds_timestamp=event.get("commence_time", ""),
                     _silent=True,
+                    _prefetched=True,
+                    _audit=audit,
                 )
+                pick = _run_result.pick
             except Exception as exc:
                 skipped.append({
                     "match":   match_str,
@@ -1465,16 +853,14 @@ def scan_today(cfg_path: str = "config.json") -> None:
                 time.sleep(1)
                 continue
 
-            fr = pick.filter_reason or ""
+            resolved_picks.append(pick)   # collect for DailyAudit
+            fs = _run_result.final_status  # P5: use MatchFinalStatus for routing
 
-            if not fr and pick.pick_player:
-                # EV passed → Telegram was sent (or attempted)
-                if pick.pick_player == pick.player_b.short_name:
-                    pick_odds = pick.market_odds_b
-                    pick_edge = pick.edge_b
-                else:
-                    pick_odds = pick.market_odds_a
-                    pick_edge = pick.edge_a
+            if fs in _ALERT_SENT_STATUSES:
+                # EV passed → Telegram was sent (or attempted, or suppressed)
+                picked    = pick.require_picked_side()
+                pick_odds = picked["market_odds"]
+                pick_edge = picked["edge"]
                 er = getattr(pick, "evaluator_result", {}) or {}
                 alerts.append({
                     "match":          match_str,
@@ -1489,15 +875,13 @@ def scan_today(cfg_path: str = "config.json") -> None:
                     "qualified_only": False,
                     "mapping":        mapping_status,
                     "quality_tier":   pick.quality_tier,
+                    "final_status":   fs.value,
                 })
-            elif fr.startswith("EVALUATOR_"):
-                # EV passed but evaluator said no
-                if pick.pick_player == pick.player_b.short_name:
-                    pick_odds = pick.market_odds_b
-                    pick_edge = pick.edge_b
-                else:
-                    pick_odds = pick.market_odds_a
-                    pick_edge = pick.edge_a
+            elif fs in _EVALUATOR_BLOCKED_STATUSES:
+                # EV passed but evaluator held back (WATCHLIST or BLOCKED_MODEL)
+                picked    = pick.require_picked_side()
+                pick_odds = picked["market_odds"]
+                pick_edge = picked["edge"]
                 alerts.append({
                     "match":          match_str,
                     "tournament":     tournament,
@@ -1507,25 +891,21 @@ def scan_today(cfg_path: str = "config.json") -> None:
                     "odds":           pick_odds,
                     "edge":           pick_edge,
                     "confidence":     pick.confidence,
-                    "rec_action":     fr,
+                    "rec_action":     _run_result.filter_reason or fs.value,
                     "qualified_only": True,
                     "mapping":        mapping_status,
                     "quality_tier":   pick.quality_tier,
-                })
-            elif fr:
-                blocked.append({
-                    "match":   match_str,
-                    "tour":    tour.upper(),
-                    "reason":  fr,
-                    "mapping": mapping_status,
+                    "final_status":   fs.value,
                 })
             else:
-                # Both edges ≤ 0 — below threshold on both sides
+                # NO_PICK, BLOCKED_VALIDATION, or any unexpected status
+                fr = _run_result.filter_reason or ""
                 blocked.append({
-                    "match":   match_str,
-                    "tour":    tour.upper(),
-                    "reason":  "No edge on either side",
-                    "mapping": mapping_status,
+                    "match":        match_str,
+                    "tour":         tour.upper(),
+                    "reason":       fr or f"No edge ({fs.value})",
+                    "mapping":      mapping_status,
+                    "final_status": fs.value,
                 })
 
             time.sleep(1)  # polite API rate limiting
@@ -1611,3 +991,52 @@ def scan_today(cfg_path: str = "config.json") -> None:
         print(f"    One mapped     : {atp_one}")
         print(f"    Neither mapped : {atp_none}")
     print()
+
+    # ── E. DAILY AUDIT (P1 + P2) ──────────────────────────────────────────
+    audit.matches_scanned = len(resolved_picks) + len(skipped)  # P2
+    audit.populate_from_scan_results(resolved_picks, alerts, blocked, skipped)
+    audit.log_summary()
+    audit.save_audit_json()  # P2: persist JSON to data/audits/YYYY-MM-DD.json
+
+    # ── F. TOMORROW SLATE DEBUG TABLE ──────────────────────────────────────
+    from datetime import timedelta as _td
+    _tomorrow = (date.today() + _td(days=1)).strftime("%Y-%m-%d")
+    _tmrw_events = [
+        e for tour in ("atp", "wta")
+        for e in slate.get(tour, [])
+        if e.get("commence_time", "").startswith(_tomorrow)
+    ]
+    if _tmrw_events:
+        _lookup: dict = {}
+        for _a in alerts:  _lookup[_a["match"]] = _a
+        for _b in blocked: _lookup.setdefault(_b["match"], _b)
+        for _s in skipped: _lookup.setdefault(_s["match"], _s)
+        print(f"{'═'*64}")
+        print(f"F.  TOMORROW SLATE DEBUG  ({_tomorrow})")
+        print(f"{'═'*64}")
+        for _e in _tmrw_events:
+            _ms  = f"{_e['player_a']} vs {_e['player_b']}"
+            _r   = _lookup.get(_ms, {})
+            _pick_gen  = bool(_r.get("pick"))
+            _qual_only = bool(_r.get("qualified_only"))
+            _fr        = _r.get("reason", "")
+            _tier      = _r.get("quality_tier", "?")
+            _alrt      = _pick_gen and not _qual_only and _tier != "FRAGILE" and not _fr
+            _blk       = (_fr or
+                          ("EVALUATOR_BLOCKED" if _qual_only else
+                           ("FRAGILE"          if _tier == "FRAGILE" else
+                            ("NO_EDGE"         if _pick_gen else "MODEL_FILTER"))))
+            _last_a    = _e["player_a"].strip().split()[-1].lower()
+            _last_b    = _e["player_b"].strip().split()[-1].lower()
+            _mid       = f"{_tomorrow}_{_last_a}_{_last_b}"
+            print(f"  {_ms}")
+            print(f"    match_id   : {_mid}")
+            print(f"    commence   : {_e.get('commence_time', '?')}")
+            print(f"    odds_found : yes  @{_e['odds_a']:.2f}/{_e['odds_b']:.2f}  [{_e.get('sport_key','?')}]")
+            print(f"    pick_gen   : {'yes → ' + str(_r.get('pick', '')) if _pick_gen else 'no'}")
+            print(f"    alertable  : {'yes' if _alrt else 'no'}")
+            print(f"    blocked_by : {_blk if not _alrt else 'none (passed pipeline filters)'}")
+            print(f"    tg_sent    : {'yes (check [DEDUPE]/[RISK]/[TELEGRAM] logs)' if _alrt else 'no'}")
+            print()
+    else:
+        log.info(f"[SCAN] no events scheduled for tomorrow ({_tomorrow})")
