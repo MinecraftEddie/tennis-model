@@ -140,6 +140,12 @@ class MatchRunResult:
     alert_decision:     Optional[object] = None       # AlertDecision | None
     pick:               Optional[object] = None       # MatchPick | None
     filter_reason:      Optional[str]   = None        # legacy compat
+    # ── Audit intermediates (read-only, consumed by audit tools) ───────────
+    ev_a:               Optional[object] = None       # EVResult side A
+    ev_b:               Optional[object] = None       # EVResult side B
+    best_ev_side:       Optional[str]    = None       # "A" or "B"
+    days_inactive:      Optional[int]    = None       # max of both players
+    validation:         Optional[object] = None       # ValidationResult
 
 
 # ── Status builder ─────────────────────────────────────────────────────────────
@@ -473,6 +479,11 @@ def run_match_core(
         alert_decision=_ad,
         pick=pick,
         filter_reason=pick.filter_reason or None,
+        ev_a=ev_a,
+        ev_b=ev_b,
+        best_ev_side="A" if ev_a.edge > ev_b.edge else "B",
+        days_inactive=days_inactive,
+        validation=validation,
     )
 
     # ── Audit recording ───────────────────────────────────────────────────────
@@ -481,6 +492,13 @@ def run_match_core(
             _audit.record_match_result(_result)
         except Exception as _ae:
             log.warning(f"[AUDIT] record failed (non-blocking): {_ae}")
+
+    # ── Pick tracking (Step 1 post-P6) ───────────────────────────────────────
+    try:
+        from tennis_model.tracking.pick_store import maybe_record_pick
+        maybe_record_pick(_result)
+    except Exception as _pt_exc:
+        log.warning(f"[PICK_TRACK] record failed (non-blocking): {_pt_exc}")
 
     return _result
 

@@ -48,10 +48,95 @@ def main():
                    help="Run the model and force-send a Telegram alert regardless of edge threshold")
     p.add_argument("--scan-today",  action="store_true",
                    help="Scan the full ATP+WTA slate from The Odds API and evaluate every available match")
+    p.add_argument("--calibration", action="store_true",
+                   help="Print calibration diagnostic (breakdowns by odds/stake/quality)")
+    p.add_argument("--cal-date",    type=str, default=None,
+                   help="Date for calibration diagnostic (YYYY-MM-DD, default: today)")
+    p.add_argument("--blocked-diagnostic", action="store_true",
+                   help="Print blocked-matches diagnostic (reason breakdown)")
+    p.add_argument("--blocked-date", type=str, default=None,
+                   help="Date for blocked diagnostic (YYYY-MM-DD, default: today)")
+    p.add_argument("--blocked-range-start", type=str, default=None,
+                   help="Start date for blocked diagnostic range (YYYY-MM-DD)")
+    p.add_argument("--blocked-range-end", type=str, default=None,
+                   help="End date for blocked diagnostic range (YYYY-MM-DD)")
+    p.add_argument("--settle", action="store_true",
+                   help="Settle unsettled picks (auto-fetch results from API, fallback to manual)")
+    p.add_argument("--settle-date", type=str, default=None,
+                   help="Date for settlement (YYYY-MM-DD, default: today)")
+    p.add_argument("--audit-match", type=str, default=None,
+                   help="Audit a specific match: --audit-match 'A vs B' --market_odds OA OB")
+    p.add_argument("--verbose", action="store_true",
+                   help="Enable verbose pipeline trace in audit mode")
     args = p.parse_args()
 
     if args.scan_today:
         scan_today(args.config)
+        return
+
+    if args.audit_match:
+        from tennis_model.scripts.audit_match import run_audit
+        if not args.market_odds:
+            print("--audit-match requires --market_odds OA OB")
+            return
+        report = run_audit(
+            match_str=args.audit_match,
+            market_odds_a=args.market_odds[0],
+            market_odds_b=args.market_odds[1],
+            surface=args.surface,
+            tournament=args.tournament,
+            tournament_lvl=args.level,
+            tour=args.tour or "atp",
+            bookmaker=args.bookmaker,
+            verbose=args.verbose,
+        )
+        print(report)
+        return
+
+    if args.settle:
+        from tennis_model.tracking.auto_settlement import settle_unsettled_picks
+        from tennis_model.tracking.performance import load_and_summarize
+        date = args.settle_date
+        count = settle_unsettled_picks(date)
+        if count == 0:
+            print("No picks settled (no new winners available or all already settled).")
+        else:
+            print(f"Settled {count} pick(s).")
+        summary = load_and_summarize(date)
+        if summary.settled_picks > 0:
+            print(
+                f"\nPerformance ({date or 'today'}):\n"
+                f"  Settled: {summary.settled_picks}  "
+                f"W: {summary.wins}  L: {summary.losses}  "
+                f"Win rate: {summary.win_rate:.1%}\n"
+                f"  P&L: {summary.total_profit_units:+.2f}u  "
+                f"ROI: {summary.roi:.1%}  "
+                f"Avg odds: {summary.average_odds:.2f}"
+            )
+        return
+
+    if args.blocked_diagnostic:
+        from tennis_model.tracking.blocked_diagnostic import (
+            load_and_summarize_blocked,
+            load_and_summarize_blocked_range,
+            format_blocked_diagnostic,
+        )
+        if args.blocked_range_start and args.blocked_range_end:
+            diag = load_and_summarize_blocked_range(
+                args.blocked_range_start, args.blocked_range_end,
+            )
+        else:
+            diag = load_and_summarize_blocked(args.blocked_date)
+        print(format_blocked_diagnostic(diag))
+        return
+
+    if args.calibration:
+        from tennis_model.tracking.calibration_diagnostic import (
+            build_calibration_diagnostic,
+            format_calibration_diagnostic,
+        )
+        diag = build_calibration_diagnostic(args.cal_date)
+        print(format_calibration_diagnostic(diag))
         return
 
     if args.odds_check:

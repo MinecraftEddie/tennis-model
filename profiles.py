@@ -49,6 +49,13 @@ PLAYER_ID_MAP = {
     "baez":         ("Sebastian Baez",       "sebastian-baez",       "B0BZ"),
     "davidovich":   ("Alejandro Davidovich", "alejandro-davidovich", "D0AF"),
     "bublik":       ("Alexander Bublik",     "alexander-bublik",     "B0BU"),
+    "korda":        ("Sebastian Korda",      "sebastian-korda",      "K0AH"),
+    "landaluce":    ("Martin Landaluce",     "martin-landaluce",     "L0IL"),
+    "lehecka":      ("Jiri Lehecka",         "jiri-lehecka",         "L0BV"),
+    "vacherot":     ("Valentin Vacherot",    "valentin-vacherot",    "VA25"),
+    "fils":         ("Arthur Fils",          "arthur-fils",          "F0F1"),
+    "michelsen":    ("Alex Michelsen",       "alex-michelsen",       "M0QI"),
+    "atmane":       ("Terence Atmane",       "terence-atmane",       "A0GC"),
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -649,5 +656,9 @@ WTA_PROFILES = {
     "marie bouzkova": dict(
         full_name="Marie Bouzkova", age=26, height_cm=170, plays="Right-handed",
         turned_pro=2016, career_wins=120, career_losses=100, career_high_rank=30,
+    ),
+    "belinda bencic": dict(
+        full_name="Belinda Bencic", age=27, height_cm=175, plays="Right-handed",
+        turned_pro=2012, career_wins=340, career_losses=180, career_high_rank=4,
     ),
 }
